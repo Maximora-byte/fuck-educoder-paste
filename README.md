@@ -2,7 +2,7 @@
 
 基于 [ystemsrx/fuck-educoder-paste](https://github.com/ystemsrx/fuck-educoder-paste) 的 MIT fork。针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1)、[#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)，改进编辑器选区、原文粘贴和错误目标防护。
 
-当前改动在本 fork 的 [Draft PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1)，尚未合并或发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
+当前改动在本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1)，尚未合并或发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
 
 ## 本次升级
 
@@ -33,7 +33,8 @@ node --check fuck-educoder-paste.user.js
 node --test tests/*.test.cjs
 ```
 
-- 当前 94 个隔离回归测试通过。原有 54 项防护仍覆盖；其中旧 Ctrl+V 隐藏输入框集成用例改为验证真实焦点保留和普通粘贴事件。新增 40 项适配器及事件回退测试。
+- 当前 121 个隔离回归测试通过。原有 54 项防护仍覆盖；其中旧 Ctrl+V 隐藏输入框集成用例改为验证真实焦点保留和普通粘贴事件。此前新增 40 项适配器及事件回退测试，本次再增加 27 项 Monaco 异常回退测试。
+- Monaco 异常修复：缺少必要 API 或写入前抛错时保留原生事件；写入后抛错时通过原模型版本/内容变化避免重复粘贴，同文本替换使用版本变化判断。异常时仍尝试关闭撤销边界。扩展后的 41 项 Monaco 测试在修复前为 21 通过、20 失败，修复后全部通过。
 - 测试提取实际源码函数，使用编辑器 API / DOM 模拟。包括只读、验证器取消、同文本替换、异常后重复粘贴、错误实例/宿主、动态挂载、旧焦点/选区及异步光标变化。
 - 可选 `node tests/browser-smoke.cjs` 使用预装 Playwright 和 Chromium（可用 `CHROMIUM_PATH` 指定路径）。所有页面请求本地填充或阻断；不访问课程站点，UEditor / CodeMirror 仍是 API 模拟。无需为基础测试安装它们。
 - **浏览器夹具未运行通过**：本次环境在 Chromium 启动时拒绝创建进程单例 socket，六个浏览器断言均未执行；仅脚本语法检查通过。真实浏览器撤销栈、扩展注入时序和真实编辑器版本兼容性尚未验证。

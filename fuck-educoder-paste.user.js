@@ -316,7 +316,13 @@
     }
 
     function insertIntoMonaco(editor, text, Selection) {
+      // An incomplete exposed API must leave the original paste untouched.
+      if (typeof Selection !== "function" ||
+          ["getModel", "getSelections", "getRawOptions", "pushUndoStop", "executeEdits"]
+            .some(name => typeof editor?.[name] !== "function")) return false;
       const model = editor.getModel();
+      if (!model || ["getValue", "getVersionId", "getLineContent"]
+          .some(name => typeof model[name] !== "function")) return false;
       const selections = editor.getSelections();
       // Preserve Monaco's native multicursor semantics rather than guessing
       // how clipboard content should be distributed among several selections.
@@ -348,11 +354,31 @@
         : lines[lines.length - 1].length + 1;
       const endSelections = [new Selection(endLine, endColumn, endLine, endColumn)];
 
+      // Keep the exact model, not a later model returned after a callback.
+      // A version change also detects a same-text replacement whose content
+      // comparison alone cannot distinguish from a rejected/no-op edit.
+      const beforeValue = model.getValue();
+      const beforeVersion = model.getVersionId();
+      const didMutate = () => {
+        try { if (model.getVersionId() !== beforeVersion) return true; } catch (_) {}
+        try { if (model.getValue() !== beforeValue) return true; } catch (_) {}
+        return false;
+      };
       editor.pushUndoStop();
-      const inserted = editor.executeEdits("pasteUnlock",
-        [{ range, text, forceMoveMarkers: true }], endSelections);
-      editor.pushUndoStop();
-      return inserted;
+      let inserted = false;
+      try {
+        inserted = editor.executeEdits("pasteUnlock",
+          [{ range, text, forceMoveMarkers: true }], endSelections) === true;
+      } catch (err) {
+        console.warn("[pasteUnlock] Monaco edit failed:", err);
+      } finally {
+        // Close the undo group even if an editor callback throws after writing.
+        // Failure here must not turn a completed edit into a native retry.
+        try { editor.pushUndoStop(); } catch (err) {
+          console.warn("[pasteUnlock] Monaco undo boundary failed:", err);
+        }
+      }
+      return inserted || didMutate();
     }
 
     function insertTextAtCursor(target, text) {
@@ -536,9 +562,9 @@
             if (!insertIntoMonaco(editor, raw, Selection)) return;
           } catch (err) {
             console.warn("[pasteUnlock] Monaco paste failed:", err);
+            return;
           }
-          // Also cancel on a failed edit: it may have changed the model before
-          // throwing, so a second native insertion would risk duplicate text.
+          // Cancel only a successful edit or a verified model mutation.
           e.stopImmediatePropagation();
           e.preventDefault();
           return;

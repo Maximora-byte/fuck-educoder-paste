@@ -56,7 +56,7 @@ function setup({ monaco = true, readonly = false, disabled = false, selected = f
     closest: () => monaco ? root : null, focus() { doc.activeElement = this; } });
   doc.activeElement = target;
   let current = selections || [new Selection(1, 5, 1, selected ? 8 : 5)];
-  const model = { value, getLineContent(lineNumber) { return this.value.split('\n')[lineNumber - 1]; } };
+  const model = { value, version: 1, getValue() { return this.value; }, getVersionId() { return this.version; }, getLineContent(lineNumber) { return this.value.split('\n')[lineNumber - 1]; } };
   const history = [];
   const editor = { getDomNode: () => root, hasTextFocus: () => textFocus,
     getModel: () => model, getSelections: () => current, getRawOptions: () => ({ readOnly: readonly }),
@@ -88,6 +88,7 @@ function setup({ monaco = true, readonly = false, disabled = false, selected = f
         previous = end;
       }
       model.value = output + before.slice(previous);
+      model.version++;
       // The real API accepts either a callback or a Selection array.
       current = typeof endCursorState === 'function'
         ? endCursorState(inverse.reverse()) : endCursorState;
@@ -218,4 +219,105 @@ test('readonly and disabled textareas stay unchanged', () => {
     assert.equal(h.target.value, '    old'); assert.equal(h.calls.commands, 0);
     assert.equal(e.prevented, false);
   }
+});
+
+for (const method of ['getModel', 'getSelections', 'getRawOptions', 'pushUndoStop', 'executeEdits']) {
+  test(`missing Monaco ${method} preserves native paste without a write`, () => {
+    const h = setup(); delete h.editor[method]; const e = h.paste('text');
+    assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+    assert.equal(h.calls.edits.length, 0); assert.equal(h.model.value, '    old');
+  });
+  test(`Monaco ${method} throwing before mutation preserves native paste`, () => {
+    const h = setup(); h.editor[method] = () => { throw Error('before mutation'); };
+    const e = h.paste('text');
+    assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+    assert.equal(h.calls.edits.length, 0); assert.equal(h.model.value, '    old');
+  });
+}
+for (const method of ['getValue', 'getVersionId', 'getLineContent']) {
+  test(`missing Monaco model ${method} preserves native paste`, () => {
+    const h = setup(); delete h.model[method]; const e = h.paste('text');
+    assert.equal(e.prevented, false); assert.equal(h.calls.edits.length, 0);
+  });
+}
+test('Monaco executeEdits throwing after mutation cancels once and retains undo', () => {
+  const h = setup(); const edit = h.editor.executeEdits;
+  h.editor.executeEdits = (...args) => { edit(...args); throw Error('after mutation'); };
+  const e = h.paste('text');
+  assert.equal(e.prevented, true); assert.equal(e.stopped, true);
+  assert.equal(h.model.value, 'textold'); assert.equal(h.calls.edits.length, 1);
+  assert.equal(h.calls.undo, 2);
+  h.editor.undo(); assert.equal(h.model.value, '    old');
+});
+test('Monaco final undo stop throwing after mutation does not duplicate paste', () => {
+  const h = setup(); const stop = h.editor.pushUndoStop;
+  h.editor.pushUndoStop = () => { stop(); if (h.calls.undo === 2) throw Error('after edit'); };
+  const e = h.paste('text');
+  assert.equal(e.prevented, true); assert.equal(h.calls.edits.length, 1);
+});
+test('same-text Monaco replacement throwing after mutation is detected by version', () => {
+  const h = setup({ selected: true }); const edit = h.editor.executeEdits;
+  h.editor.executeEdits = (...args) => { edit(...args); throw Error('same text written'); };
+  const e = h.paste('old');
+  assert.equal(h.model.value, '    old'); assert.equal(h.model.version, 2);
+  assert.equal(e.prevented, true); assert.equal(h.calls.edits.length, 1);
+});
+test('Monaco rejected no-op preserves native paste', () => {
+  const h = setup(); h.editor.executeEdits = () => false;
+  const e = h.paste('text');
+  assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+});
+test('same-text Monaco no-op throwing before mutation preserves native paste', () => {
+  const h = setup({ selected: true });
+  h.editor.executeEdits = () => { throw Error('no write'); };
+  const e = h.paste('old');
+  assert.equal(h.model.value, '    old'); assert.equal(h.model.version, 1);
+  assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+});
+for (const method of ['getValue', 'getVersionId', 'getLineContent']) {
+  test(`Monaco model ${method} throwing before mutation preserves native paste`, () => {
+    const h = setup(); h.model[method] = () => { throw Error('unreadable model'); };
+    const e = h.paste('text');
+    assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+    assert.equal(h.calls.edits.length, 0);
+  });
+}
+test('Monaco Selection constructor throwing preserves native paste', () => {
+  const h = setup(); h.win.monaco.Selection = function () { throw Error('selection'); };
+  const e = h.paste('text');
+  assert.equal(e.prevented, false); assert.equal(h.calls.edits.length, 0);
+});
+for (const unreadable of ['getValue', 'getVersionId']) {
+  test(`Monaco post-write failure uses remaining evidence when ${unreadable} throws`, () => {
+    const h = setup(); const edit = h.editor.executeEdits;
+    h.editor.executeEdits = (...args) => {
+      edit(...args); h.model[unreadable] = () => { throw Error('unreadable after write'); };
+      throw Error('after write');
+    };
+    const e = h.paste('text');
+    assert.equal(e.prevented, true); assert.equal(h.model.value, 'textold');
+  });
+}
+test('Monaco mutation followed by false return is not natively duplicated', () => {
+  const h = setup(); const edit = h.editor.executeEdits;
+  h.editor.executeEdits = (...args) => { edit(...args); return false; };
+  assert.equal(h.paste('text').prevented, true);
+  assert.equal(h.calls.edits.length, 1);
+});
+test('Monaco same-text successful replacement collapses selection and stays handled', () => {
+  const h = setup({ selected: true });
+  assert.equal(h.paste('old').prevented, true);
+  assert.equal(h.model.value, '    old'); assert.equal(h.calls.edits.length, 1);
+  assert.equal(h.editor.getSelections()[0].isEmpty(), true);
+});
+test('Monaco exception checks the original model after a callback replaces the editor model', () => {
+  const h = setup({ selected: true }); const edit = h.editor.executeEdits;
+  h.editor.executeEdits = (...args) => {
+    edit(...args);
+    h.editor.getModel = () => ({ getValue: () => '    old', getVersionId: () => 1 });
+    throw Error('model replaced after same-text edit');
+  };
+  const e = h.paste('old');
+  assert.equal(e.prevented, true); assert.equal(e.stopped, true);
+  assert.equal(h.model.version, 2); assert.equal(h.calls.edits.length, 1);
 });
