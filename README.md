@@ -1,128 +1,65 @@
-# ✨最新可用 - 完美解决【头歌 / 学习通】禁复制/粘贴问题
+# 头歌 / 学习通复制粘贴助手：3.1.0 候选版
 
-一个强大的油猴脚本,用于解决头歌和超星学习通的复制粘贴限制问题。
+基于 [ystemsrx/fuck-educoder-paste](https://github.com/ystemsrx/fuck-educoder-paste) 的 MIT fork。针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1)、[#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)，改进编辑器选区、原文粘贴和错误目标防护。
 
-## 本 fork 的 3.0.1 候选修复
+当前改动在本 fork 的 [Draft PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1)，尚未合并或发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
 
-针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1) 和 [#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)：
+## 本次升级
 
-- 头歌：通过 Monaco 的公开模型编辑 API 插入原文，避免把多行粘贴当作隐藏 textarea 的逐字输入；保留选区与撤销边界。普通 textarea 有选区时不再先清空选区前的缩进。
-- 学习通：修正缺失 `contenteditable` 属性被当作可编辑的判断，仅向已确认的可编辑宿主插入；防止普通区域、旧编辑器、旧选区或焦点变化导致粘贴到错误位置，并尊重显式不可编辑区域。
-- 不新增授权域名、外部依赖或网络请求；保留原作者及 MIT 许可。
+- **Monaco**：保留 3.0.1 的公开 `executeEdits` + `Selection` 路径、撤销边界和原始多行缩进；在事件发生时发现当前编辑器，避免依赖旧实例。查找框、多光标、只读、未暴露 API 或无事件文本时交回原生流程。
+- **CodeMirror 5 风格 API**：使用 `replaceSelection` / `replaceSelections`；只有 `replaceRange` 时使用完整选区起止位置，并在可用时把光标置于插入末尾。以 `paste` 来源保留编辑器的历史机制，同文本替换也能识别成功。
+- **尊重只读及验证器**：删除临时关闭 CodeMirror `readOnly`、清空私有 `beforeChange` 回调和强制重试的实现。编辑器拒绝操作时保留原生流程；原生编辑器自己可能再次处理该事件。
+- **UEditor**：仅在已有实例的文档、body 或 iframe 身份匹配时使用实例，多个行内宿主还需匹配实际 body。发现实例不再调用会创建编辑器的 `UE.getEditor`。将已验证的实时选区交给 UEditor，再用 `execCommand('insertHTML')` 进入其撤销/内容同步机制；禁用命令不走强制 DOM 回退。
+- **普通富文本**：使用浏览器编辑命令保留撤销，`plaintext-only` 使用纯文本命令。缺少命令支持时交回原生粘贴，不再自动走直接 DOM 插入。
+- **保留真正的焦点**：Ctrl+V 不再把焦点移到隐藏输入框；自动插入只使用本次 paste / beforeinput 事件文本。同步插入成功后才取消事件；失败保留原生事件和监听器。
+- **异常防重复**：站点回调可能在内容已改变后抛错，因此根据编辑后的内容/选区确认结果，避免同一内容又被原生粘贴一次。
 
-验证命令（Node.js 18 或更新版本，无需安装依赖）：
+动态挂载和切换沿用现有扫描与事件目标发现机制；焦点、iframe 父级焦点和选区端点仍须属于当前可编辑宿主。类名、旧编辑器记录和陈旧选区不作为写入依据。显式异步剪贴板助手仍会校验宿主、选区以及 CodeMirror 模型未改变。
+
+## 使用候选版
+
+1. 使用你已有的 Tampermonkey / Violentmonkey 等脚本管理器。
+2. 打开当前分支的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/fix/paste-issues-1-2/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
+3. 只在你有权编辑的练习页面刷新并验收。原作者 Greasy Fork 发布版不包含这些未合并改动。
+
+脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`。本次没有新增域名、运行时依赖、网络请求或权限，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。原作者的复制、全选、空白剪贴板写入保护等基础逻辑继续保留。
+
+## 本地验证
+
+Node.js 18 或更新版本，无需安装依赖：
 
 ```sh
 node --check fuck-educoder-paste.user.js
 node --test tests/*.test.cjs
 ```
 
-测试是隔离的源码函数/API 模拟回归测试，不代表真实课程页、浏览器扩展或不同编辑器版本已全部通过。上游 #2 没有提供页面、浏览器或扩展版本，无法确认其全部原因。需要在有权编辑的练习页面验证多行粘贴、替换选区、撤销和多个编辑器之间切换。
+- 当前 94 个隔离回归测试通过。原有 54 项防护仍覆盖；其中旧 Ctrl+V 隐藏输入框集成用例改为验证真实焦点保留和普通粘贴事件。新增 40 项适配器及事件回退测试。
+- 测试提取实际源码函数，使用编辑器 API / DOM 模拟。包括只读、验证器取消、同文本替换、异常后重复粘贴、错误实例/宿主、动态挂载、旧焦点/选区及异步光标变化。
+- 可选 `node tests/browser-smoke.cjs` 使用预装 Playwright 和 Chromium（可用 `CHROMIUM_PATH` 指定路径）。所有页面请求本地填充或阻断；不访问课程站点，UEditor / CodeMirror 仍是 API 模拟。无需为基础测试安装它们。
+- **浏览器夹具未运行通过**：本次环境在 Chromium 启动时拒绝创建进程单例 socket，六个浏览器断言均未执行；仅脚本语法检查通过。真实浏览器撤销栈、扩展注入时序和真实编辑器版本兼容性尚未验证。
+- 没有配置或运行 GitHub Actions。
 
-学习通现在只认可实际可编辑宿主、有效选区与当前焦点，保留真实 `designMode`/可编辑 body 的 iframe 支持。仅有 editor 类名、整份文档曾包含编辑器或最近使用记录时，不再接管粘贴；无法确认目标时交回原生流程。自动粘贴处理不再延迟读取系统剪贴板；隐藏粘贴输入框失焦后不插入，也不抢回焦点。这可能减少部分旧版页面的兼容性，但避免把内容写进错误区域。
+## 验收清单
 
-Monaco 适配要求页面暴露 `monaco.editor.getEditors()`、`monaco.Selection` 和编辑器 `hasTextFocus()`，且只有一个选区。多光标、这些 API 不可用、焦点位于查找/替换框，或粘贴事件没有可用文本时，此版本保留原生粘贴流程，不再写入隐藏 textarea；这种情况下平台自己的禁粘贴逻辑仍可能生效。Monaco 路径只同步使用本次粘贴事件的文本，避免异步读取后写入已经改变的选区。
+在有权编辑的练习页，分别检查：
 
-本 fork 的候选脚本需从当前分支的 `fuck-educoder-paste.user.js` 文件复制到脚本管理器中验证。下面的 Greasy Fork 安装链接仍指向原作者发布版，不包含本 fork 的未合并修复。
+1. 粘贴含空行、Tab、空格、中文及 `< > &` 的多行文本，内容不执行为 HTML。
+2. 正向/反向选中部分内容后替换，光标位于插入末尾；Ctrl+Z 一次恢复此次插入前状态。
+3. 连续粘贴两次相同内容，第二次不被吞掉；选中相同文本再粘贴不会重复插入。
+4. 在两个编辑器、普通输入框和 iframe 之间切换，内容只落到当前目标。
+5. 切换题目或动态打开编辑器后仍能粘贴；只读编辑器、不可编辑区域保持不变。
+6. 浏览器/平台拒绝剪贴板或编辑器 API 不可用时，没有旧光标写入、抢焦点或后台剪贴板读取。
 
-## 📋 功能特性
+平台限制在原生回退时仍可能生效。ACE、CodeMirror 6、未暴露 Monaco API 的构建和不同 UEditor 版本没有专门适配或完整验证。反馈问题时请附浏览器、脚本管理器、编辑器类型、复现步骤和脱敏截图，不要提交课程答案或私人数据。
 
-### 核心功能
+## 设计参考与许可
 
-- ✅ **解除复制限制** - 允许在页面任意位置复制文本
-- ✅ **解除粘贴限制** - 恢复正常的粘贴功能(Ctrl+V / Cmd+V)
-- ✅ **全选快捷键** - 恢复 Ctrl+A / Cmd+A 快捷键
-- ✅ **防剪贴板污染** - 阻止网页往剪贴板写入空白内容
-- ✅ **智能缩进处理** - 在代码编辑器中粘贴时自动清理光标前的多余缩进
+本次采用独立实现，保留原作者 ystemsrx 的署名和 [MIT LICENSE](LICENSE)，不引入以下项目的运行时代码或附属功能：
 
-### 技术亮点
+- [MuQY1818/ChaoXing_Code_Paste](https://github.com/MuQY1818/ChaoXing_Code_Paste/blob/64a1f630ef70fe55528021fd182da74b3854d904/chaoxing-paste-helper.user.js)：脚本头声明 MIT；参考按 CodeMirror / UEditor 区分粘贴方式、恢复选区的设计。未加入图片上传或 localStorage。
+- [Wan-JD/educoder-helper](https://github.com/Wan-JD/educoder-helper/tree/f11cf70ab875e3fbe5143e034129bf663c6e22e3)：[MIT](https://github.com/Wan-JD/educoder-helper/blob/f11cf70ab875e3fbe5143e034129bf663c6e22e3/LICENSE)；参考 Monaco 发现与动态页面适配思路，保留本 fork 既有的安全 API 路径，不引入其额外面板或网络功能。
+- [iPycc/Fk-Chaoxing-Extension](https://github.com/iPycc/Fk-Chaoxing-Extension/tree/f223ed213311abba83a55ed7a72f2ea60b30487d)：[MIT](https://github.com/iPycc/Fk-Chaoxing-Extension/blob/f223ed213311abba83a55ed7a72f2ea60b30487d/LICENSE)；参考按 iframe / 富文本类型分离处理的思路，未加入 AI 答题、提取题目或 API token 功能。
 
-- 🚀 在 `document-start` 阶段注入,确保最早执行
-- 🛡️ 拦截网页的复制/粘贴事件监听器
-- 📝 保留粘贴内容的原始格式和缩进
-- 🔒 阻止网页显示"禁止复制"提示
-- 💡 允许全站文本选中
+没有复制许可声明冲突的旧 Chaoxing-CopyPaste-Helper，亦未引入其他项目的考试设置修改、签名采集或 AGPL 代码。
 
-## 🚀 安装使用
-
-### 前置要求
-
-- 安装浏览器扩展管理器(任选其一):
-  - [Tampermonkey](https://www.tampermonkey.net/)
-  - [Violentmonkey](https://violentmonkey.github.io/)
-  - [Greasemonkey](https://www.greasespot.net/)
-
-### 安装步骤
-
-1. 安装上述任一扩展管理器
-2. 点击 [安装脚本](https://greasyfork.org/zh-CN/scripts/558152-2026%E6%9C%80%E6%96%B0%E5%8F%AF%E7%94%A8-%E5%AE%8C%E7%BE%8E%E8%A7%A3%E5%86%B3-%E5%A4%B4%E6%AD%8C%E5%B9%B3%E5%8F%B0-%E7%A6%81%E5%A4%8D%E5%88%B6-%E7%B2%98%E8%B4%B4%E9%97%AE%E9%A2%98)
-3. 在弹出的页面点击"安装"按钮
-4. 访问 [头歌平台](https://www.educoder.net/) 即可使用
-
-## 📖 工作原理
-
-### 1. 快捷键拦截
-
-脚本在捕获阶段拦截 Ctrl+C、Ctrl+V、Ctrl+A 等快捷键,阻止平台的监听器接收这些事件。
-
-### 2. 剪贴板保护
-
-- 重写 `navigator.clipboard.writeText()` 和 `clipboard.write()` 方法
-- 检测并拦截尝试写入空白内容的操作
-- 保护用户剪贴板不被恶意清空
-
-### 3. 智能粘贴
-
-- 识别代码编辑器环境
-- 粘贴前清理光标前的纯空格/Tab缩进
-- 保留粘贴内容本身的原始格式
-
-### 4. 文本选择
-
-- 全局启用 `user-select: text`
-- 隐藏平台的"禁止复制"提示框
-
-## 🎯 适用范围
-
-### 支持的域名
-
-- `https://www.educoder.net/*`
-- `https://educoder.net/*`
-- `https://*.educoder.net/*`
-- `https://www.educoder.net/*`
-- `https://educoder.net/*`
-- `https://*.educoder.net/*`
-- `*://*.chaoxing.com/*`
-- `*://chaoxing.com/*`
-- `*://*.xueyinonline.com/*`
-- `*://xueyinonline.com/*`
-- `*://*.chaoxingerya.com/*`
-- `*://chaoxingerya.com/*`
-
-### 支持的编辑器
-
-- Monaco Editor
-- ACE Editor
-- CodeMirror
-- 原生 textarea
-- contenteditable 元素
-
-## ⚠️ 注意事项
-
-1. **浏览器兼容性**: 推荐使用 Chrome、Edge、Firefox 最新版本
-2. **权限要求**: 脚本需要访问剪贴板 API
-3. **其他脚本冲突**: 如有其他修改剪贴板的脚本,可能产生冲突
-4. **平台更新**: 如平台更新反制措施,脚本可能需要更新
-
-## 🤝 贡献指南
-
-欢迎提交 Issue 和 Pull Request!
-
-## 📄 许可证
-
-MIT License - 详见 [LICENSE](LICENSE) 文件
-
----
-
-**免责声明**: 本脚本仅用于改善用户体验,使用者需遵守平台相关规定,因使用本脚本造成的任何后果由使用者自行承担。
-
+仅用于改善合法编辑体验，请遵守平台规则和学术诚信要求。

@@ -610,7 +610,7 @@ test('explicit clipboard helper inserts when the CodeMirror model and cursor sta
 });
 
 
-test('paste key refuses a cross-host selection despite saved caret, then completes a valid catcher', () => {
+test('paste key preserves real focus for invalid and valid selections, then ordinary paste inserts', () => {
   const { h, doc, a, b, callbacks, restored } = catcherFixture(false);
   doc.activeElement = b;
   const invalid = makeRange(a, b);
@@ -627,10 +627,57 @@ test('paste key refuses a cross-host selection despite saved caret, then complet
 
   doc.selection = makeSelection(makeRange(b));
   h.handleKeyDownEvent({ type: 'keydown', key: 'v', ctrlKey: true, target: b });
-  const session = h.state.activePasteSession;
-  assert.ok(session?.catcher);
-  session.catcher.listeners.paste({ text: 'valid text' });
+  assert.equal(h.state.activePasteSession, undefined);
+  assert.equal(doc.activeElement, b);
+  h.getClipboardTextFromEvent = () => 'valid text';
+  vm.runInContext(extractFunction('handlePasteEvent'), h);
+  h.handlePasteEvent({ type: 'paste', target: b });
   assert.equal(h.inserted.length, 1);
   assert.equal(h.inserted[0].route.el, b);
   assert.equal(doc.activeElement, b);
+});
+
+test('failed synchronous paste insertion retains native event and listeners', () => {
+  const { h, a } = setupRich();
+  h.getClipboardTextFromEvent = () => 'text';
+  h.insertByRoute = () => false;
+  let cancelled = false;
+  h.hardCancel = () => { cancelled = true; };
+  vm.runInContext(extractFunction('handlePasteEvent'), h);
+  const event = { type: 'paste', target: a };
+  h.handlePasteEvent(event);
+  assert.equal(cancelled, false);
+  assert.equal(event.__cxAllowNativePaste, true);
+  assert.equal(h.shouldSuppressExternalPasteListener(event, 'paste'), false);
+});
+
+test('failed beforeinput insertion retains native event and listeners', () => {
+  const { h, a } = setupRich();
+  h.insertByRoute = () => false;
+  let cancelled = false;
+  h.hardCancel = () => { cancelled = true; };
+  vm.runInContext(extractFunction('handleBeforeInputEvent'), h);
+  const event = { type: 'beforeinput', inputType: 'insertFromPaste', target: a, data: 'text' };
+  h.handleBeforeInputEvent(event);
+  assert.equal(cancelled, false);
+  assert.equal(event.__cxAllowNativePaste, true);
+  assert.equal(h.shouldSuppressExternalPasteListener(event, 'beforeinput'), false);
+});
+
+test('native rich same-text replacement followed by a thrown callback stays handled', () => {
+  const { h, doc, a } = setupRich();
+  const range = makeRange(a);
+  range.startOffset = 0;
+  range.endOffset = 4;
+  doc.selection = makeSelection(range);
+  a.innerHTML = 'same';
+  h.findUEditorByDoc = () => null;
+  h.syncRichEditor = () => {};
+  h.state.markInserted = () => {};
+  doc.execCommand = () => {
+    range.startOffset = range.endOffset;
+    throw new Error('page callback failed after selection collapsed');
+  };
+  vm.runInContext(['escapeHTML', 'escapeRichLine', 'plainTextToRichHTML', 'insertIntoRichEditor'].map(extractFunction).join('\n'), h);
+  assert.equal(h.insertIntoRichEditor({ type: 'rich', doc, el: a }, 'same'), true);
 });
