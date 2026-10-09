@@ -1212,38 +1212,17 @@
 
     function closestEditableHost(node) {
       const start = toElement(node);
-      if (!start) return null;
-      if (isPlainInput(start)) return null;
-      if (isExplicitlyNonEditable(start)) return null;
+      if (!start || isPlainInput(start) || isExplicitlyNonEditable(start)) return null;
 
+      let host = null;
       try {
-        for (
-          let cur = start;
-          cur && cur.nodeType === 1;
-          cur = cur.parentElement
-        ) {
-          if (isPlainInput(cur)) return null;
-          if (isEditableElement(cur)) return cur;
-
-          const cls = lower(cur.className);
-          const id = lower(cur.id);
-          const role = lower(cur.getAttribute?.("role"));
-
-          if (
-            role === "textbox" ||
-            cls.includes("edui-body-container") ||
-            cls.includes("cke_editable") ||
-            cls.includes("ql-editor") ||
-            cls.includes("w-e-text") ||
-            id.includes("ueditor") ||
-            id.includes("edui")
-          ) {
-            return cur;
-          }
+        for (let cur = start; cur && cur.nodeType === 1; cur = cur.parentElement) {
+          if (isPlainInput(cur) || lower(cur.getAttribute?.("contenteditable")) === "false") break;
+          if (isEditableElement(cur)) host = cur;
+          else if (host) break;
         }
       } catch (_) {}
-
-      return null;
+      return host;
     }
 
     function findCodeMirrorFromElement(el) {
@@ -1281,40 +1260,13 @@
     }
 
     function findCodeMirrorFromEvent(e) {
-      for (const node of eventPath(e)) {
-        const cm = findCodeMirrorFromElement(node);
-        if (cm) return cm;
+      // Only the actual event target identifies the editor. Other frames may
+      // retain activeElement, and a recently used editor is not a paste target.
+      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
+      if (!e?.target?.nodeType || e.target.nodeType === 9) {
+        if (!documentHasFocus(doc)) return null;
       }
-
-      for (const cm of state.codeMirrors) {
-        try {
-          const wrapper = cm.getWrapperElement?.();
-          const active = wrapper?.ownerDocument?.activeElement;
-
-          if (
-            wrapper &&
-            active &&
-            (wrapper === active || wrapper.contains(active))
-          ) {
-            return cm;
-          }
-
-          const input = cm.getInputField?.();
-
-          if (input && active === input) {
-            return cm;
-          }
-        } catch (_) {}
-      }
-
-      if (
-        state.lastTarget?.type === "codemirror" &&
-        Date.now() - state.lastTargetAt < 60000
-      ) {
-        return state.lastTarget.cm;
-      }
-
-      return null;
+      return findCodeMirrorFromElement(e?.target);
     }
 
     function withTemporaryReadWrite(cm, fn) {
@@ -1636,9 +1588,8 @@
 
         const range = sel.getRangeAt(0);
 
-        if (!rangeBelongsToDoc(range, doc)) {
-          return false;
-        }
+        const host = getDefaultRichHost(doc);
+        if (!rangeBelongsToRichHost(range, doc, host)) return false;
 
         state.richRanges.set(doc, range.cloneRange());
         return true;
@@ -1647,20 +1598,44 @@
       }
     }
 
-    function getDefaultRichHost(doc, preferred) {
-      if (
-        preferred &&
-        preferred.ownerDocument === doc &&
-        !isPlainInput(preferred) &&
-        !isPasteCatcherNode(preferred)
-      ) {
-        return preferred;
+    function documentHasFocus(doc) {
+      try {
+        if (doc?.hasFocus?.() !== true) return false;
+        let frame = getFrameElement(getWin(doc));
+        while (frame) {
+          if (frame.isConnected === false || frame.ownerDocument?.activeElement !== frame) return false;
+          frame = getFrameElement(getWin(frame.ownerDocument));
+        }
+        return true;
+      } catch (_) {
+        return false;
       }
+    }
 
-      const activeHost = closestEditableHost(doc?.activeElement);
-      if (activeHost && !isPasteCatcherNode(activeHost)) return activeHost;
+    function getDefaultRichHost(doc, preferred) {
+      if (!doc?.body) return null;
+      if (!preferred && !documentHasFocus(doc)) return null;
+      const el = toElement(preferred || doc.activeElement);
+      if (!el || el.ownerDocument !== doc || el.isConnected === false ||
+          isPlainInput(el) || isPasteCatcherNode(el) || isExplicitlyNonEditable(el)) return null;
 
-      return doc?.body || null;
+      // Whole-document editing is still confined to visible body content.
+      if (el !== doc.body && !doc.body.contains(el)) return null;
+      if (lower(doc.designMode) === "on") return doc.body;
+      const host = closestEditableHost(el);
+      return host === doc.documentElement ? doc.body : host;
+    }
+
+    function rangeBelongsToRichHost(range, doc, host) {
+      if (!host || !rangeBelongsToDoc(range, doc)) return false;
+      try {
+        return [range.startContainer, range.endContainer].every(node =>
+          node && (node === host || host.contains(node)) &&
+          getDefaultRichHost(doc, toElement(node)) === host
+        );
+      } catch (_) {
+        return false;
+      }
     }
 
     function focusRichDoc(doc, preferredHost) {
@@ -1669,6 +1644,7 @@
       const win = getWin(doc);
       const frame = getFrameElement(win);
       const host = getDefaultRichHost(doc, preferredHost);
+      if (!host) return;
 
       try {
         frame?.focus?.({ preventScroll: true });
@@ -1681,8 +1657,6 @@
       try {
         if (host && typeof host.focus === "function") {
           host.focus({ preventScroll: true });
-        } else {
-          doc.body.focus?.({ preventScroll: true });
         }
       } catch (_) {}
 
@@ -1693,40 +1667,31 @@
 
     function ensureRichRange(doc, preferredHost) {
       if (!doc?.body) return null;
-
+      const host = getDefaultRichHost(doc, preferredHost);
+      if (!host) return null;
       const win = getWin(doc);
-      const host = getDefaultRichHost(doc, preferredHost) || doc.body;
-
-      focusRichDoc(doc, host);
 
       try {
         const sel = win.getSelection?.();
         if (!sel) return null;
-
+        // The caret may have moved before selectionchange has been delivered.
+        if (sel.rangeCount > 0) {
+          const current = sel.getRangeAt(0);
+          if (!rangeBelongsToRichHost(current, doc, host)) return null;
+          state.richRanges.set(doc, current.cloneRange());
+          return current;
+        }
         const saved = state.richRanges.get(doc);
-
-        if (saved && rangeBelongsToDoc(saved, doc)) {
+        if (saved && rangeBelongsToRichHost(saved, doc, host)) {
           sel.removeAllRanges();
           sel.addRange(saved);
           return saved;
         }
-
-        if (sel.rangeCount > 0) {
-          const current = sel.getRangeAt(0);
-
-          if (rangeBelongsToDoc(current, doc)) {
-            state.richRanges.set(doc, current.cloneRange());
-            return current;
-          }
-        }
-
         const range = doc.createRange();
-        range.selectNodeContents(host || doc.body);
+        range.selectNodeContents(host);
         range.collapse(false);
-
         sel.removeAllRanges();
         sel.addRange(range);
-
         state.richRanges.set(doc, range.cloneRange());
         return range;
       } catch (_) {
@@ -1830,9 +1795,7 @@
         let block = findBlockForRange(range, host, doc);
 
         if (!block) {
-          block =
-            findSingleEmptyBlockInHost(host || doc.body) ||
-            findSingleEmptyBlockInHost(doc.body);
+          block = findSingleEmptyBlockInHost(host);
         }
 
         if (!block || block === doc.body || !isVisuallyEmptyBlock(block)) {
@@ -2001,9 +1964,9 @@
 
     function insertHTMLByRange(route, html) {
       const doc = route.doc;
-      const host = getDefaultRichHost(doc, route.el) || doc.body;
+      const host = getDefaultRichHost(doc, route.el);
 
-      if (!doc?.body || html == null) return false;
+      if (!host || html == null) return false;
 
       const before = doc.body.innerHTML;
 
@@ -2015,14 +1978,7 @@
 
         let range = ensureRichRange(doc, host);
 
-        if (!range || !rangeBelongsToDoc(range, doc)) {
-          range = doc.createRange();
-          range.selectNodeContents(host || doc.body);
-          range.collapse(false);
-
-          sel.removeAllRanges();
-          sel.addRange(range);
-        }
+        if (!rangeBelongsToRichHost(range, doc, host)) return false;
 
         range = normalizeRangeBeforeRichInsert(doc, range, host);
 
@@ -2066,15 +2022,14 @@
       if (!route?.doc?.body || !text) return false;
 
       const doc = route.doc;
-      const host = getDefaultRichHost(doc, route.el) || doc.body;
+      const host = getDefaultRichHost(doc, route.el);
+      if (!host) return false;
 
       route.el = host;
 
       patchRichDoc(doc, true);
 
       state.remember(route);
-      focusRichDoc(doc, host);
-      ensureRichRange(doc, host);
 
       const html = plainTextToRichHTML(text);
       const ok = insertHTMLByRange(route, html);
@@ -2088,96 +2043,15 @@
     }
 
     function richRouteFromEvent(e) {
-      for (const node of eventPath(e)) {
-        if (isPasteCatcherNode(node)) return null;
-
-        const el = toElement(node);
-
-        if (isPlainInput(el)) {
-          return null;
-        }
-
-        const doc = getDoc(node);
-        if (!doc?.body) continue;
-
-        const host = closestEditableHost(node);
-
-        if (host) {
-          patchRichDoc(doc, true);
-
-          return {
-            type: "rich",
-            doc,
-            el: host
-          };
-        }
-
-        if (state.richDocs.has(doc)) {
-          return {
-            type: "rich",
-            doc,
-            el: getDefaultRichHost(doc, doc.activeElement)
-          };
-        }
-
-        if (looksLikeRichDoc(doc)) {
-          patchRichDoc(doc, true);
-
-          return {
-            type: "rich",
-            doc,
-            el: getDefaultRichHost(doc, doc.activeElement)
-          };
-        }
+      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
+      if (!doc?.body) return null;
+      if (!e?.target?.nodeType || e.target.nodeType === 9) {
+        if (!documentHasFocus(doc)) return null;
       }
-
-      for (const doc of state.richDocs) {
-        try {
-          const host = closestEditableHost(doc.activeElement);
-
-          if (host) {
-            return {
-              type: "rich",
-              doc,
-              el: host
-            };
-          }
-
-          if (doc.hasFocus?.()) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-
-          const frame = getFrameElement(getWin(doc));
-
-          if (frame && frame.ownerDocument?.activeElement === frame) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-        } catch (_) {}
-      }
-
-      return null;
-    }
-
-    function shouldUseLastRichRoute(e) {
-      if (!isPasteLikeEvent(e)) return false;
-      if (!state.lastTarget || state.lastTarget.type !== "rich") return false;
-      if (Date.now() - state.lastTargetAt > 180000) return false;
-
-      const targetEl = toElement(e?.target);
-
-      if (isPlainInput(targetEl) || isPasteCatcherNode(targetEl)) {
-        return false;
-      }
-
-      return true;
+      const host = getDefaultRichHost(doc, toElement(e?.target));
+      if (!host) return null;
+      patchRichDoc(doc, true);
+      return { type: "rich", doc, el: host };
     }
 
     function routeFromEvent(e) {
@@ -2199,10 +2073,6 @@
       const rich = richRouteFromEvent(e);
       if (rich) return rich;
 
-      if (shouldUseLastRichRoute(e)) {
-        return state.lastTarget;
-      }
-
       return null;
     }
 
@@ -2210,66 +2080,76 @@
       for (const cm of state.codeMirrors) {
         try {
           const wrapper = cm.getWrapperElement?.();
-          const active = wrapper?.ownerDocument?.activeElement;
-
-          if (
-            wrapper &&
-            active &&
-            (wrapper === active || wrapper.contains(active))
-          ) {
-            return {
-              type: "codemirror",
-              cm
-            };
-          }
-
-          const input = cm.getInputField?.();
-
-          if (input && active === input) {
-            return {
-              type: "codemirror",
-              cm
-            };
+          const doc = wrapper?.ownerDocument;
+          if (wrapper?.isConnected === false || !documentHasFocus(doc)) continue;
+          const active = doc.activeElement;
+          if (active && (wrapper === active || wrapper.contains(active) || cm.getInputField?.() === active)) {
+            return { type: "codemirror", cm };
           }
         } catch (_) {}
       }
-
       for (const doc of state.richDocs) {
-        try {
-          const host = closestEditableHost(doc.activeElement);
-
-          if (host) {
-            return {
-              type: "rich",
-              doc,
-              el: host
-            };
-          }
-
-          if (doc.hasFocus?.()) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-        } catch (_) {}
+        const host = getDefaultRichHost(doc);
+        if (host) return { type: "rich", doc, el: host };
       }
-
-      if (state.lastTarget && Date.now() - state.lastTargetAt < 180000) {
-        return state.lastTarget;
-      }
-
       return null;
+    }
+
+    function isCurrentRoute(route) {
+      if (route?.type === "rich") {
+        return getDefaultRichHost(route.doc) === route.el;
+      }
+      if (route?.type !== "codemirror") return false;
+      try {
+        const wrapper = route.cm.getWrapperElement?.();
+        const doc = wrapper?.ownerDocument;
+        if (!wrapper || wrapper.isConnected === false || !documentHasFocus(doc)) return false;
+        const active = doc.activeElement;
+        return !!active && (wrapper === active || wrapper.contains(active) || route.cm.getInputField?.() === active);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function capturePasteRoute(route) {
+      if (!isCurrentRoute(route)) return null;
+      try {
+        if (route.type === "rich") {
+          const selection = getWin(route.doc).getSelection?.();
+          if (selection?.rangeCount !== 1) return null;
+          const range = selection.getRangeAt(0);
+          if (!rangeBelongsToRichHost(range, route.doc, route.el)) return null;
+          return { route, start: range.startContainer, startOffset: range.startOffset,
+            end: range.endContainer, endOffset: range.endOffset };
+        }
+        const cm = route.cm;
+        if (typeof cm.listSelections !== "function") return null;
+        const selections = cm.listSelections();
+        if (!selections?.length) return null;
+        const positions = selections.map(({ anchor, head }) => [anchor.line, anchor.ch, head.line, head.ch]);
+        return { route, model: cm.getDoc?.() || cm.doc, positions: JSON.stringify(positions) };
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function matchesPasteRoute(snapshot) {
+      const current = snapshot && capturePasteRoute(snapshot.route);
+      if (!current) return false;
+      if (snapshot.route.type === "rich") {
+        return current.start === snapshot.start && current.startOffset === snapshot.startOffset &&
+          current.end === snapshot.end && current.endOffset === snapshot.endOffset;
+      }
+      return current.model === snapshot.model && current.positions === snapshot.positions;
     }
 
     function shouldNeutralizePasteBlocker(e) {
       try {
-        if (!isPasteLikeEvent(e)) return false;
+        if (!isPasteLikeEvent(e) || e.__cxAllowNativePaste) return false;
         if (isExplicitlyNonEditable(e?.target)) return false;
 
         if (
-          state.activePasteSession &&
+          state.activePasteSession?.catcher === toElement(e?.target) &&
           Date.now() - state.activePasteSession.startedAt < 2000
         ) {
           return true;
@@ -2291,7 +2171,7 @@
       try {
         type = lower(type);
 
-        if (!e) return false;
+        if (!e || e.__cxAllowNativePaste) return false;
         if (isPasteCatcherNode(e?.target)) return false;
         if (isExplicitlyNonEditable(e?.target)) return false;
 
@@ -2317,16 +2197,7 @@
           return false;
         }
 
-        const route = routeFromEvent(e);
-        if (route) return true;
-
-        const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
-        if (!doc?.body) return false;
-
-        if (state.richDocs.has(doc) || looksLikeRichDoc(doc)) {
-          patchRichDoc(doc, true);
-          return true;
-        }
+        return !!routeFromEvent(e);
       } catch (_) {}
 
       return false;
@@ -2341,7 +2212,7 @@
     }
 
     function insertByRoute(route, text) {
-      if (!route || !text) return false;
+      if (!route || !text || !isCurrentRoute(route)) return false;
 
       state.remember(route);
 
@@ -2373,7 +2244,6 @@
       })();
 
       const catcherDoc = route.doc || document;
-      const catcherWin = getWin(catcherDoc);
       const oldActive = catcherDoc.activeElement;
 
       const session = {
@@ -2409,17 +2279,19 @@
         try {
           if (
             savedRangeBeforeCatch &&
-            rangeBelongsToDoc(savedRangeBeforeCatch, route.doc)
+            rangeBelongsToRichHost(savedRangeBeforeCatch, route.doc, getDefaultRichHost(route.doc, route.el))
           ) {
-            state.richRanges.set(
-              route.doc,
-              savedRangeBeforeCatch.cloneRange()
-            );
+            const range = savedRangeBeforeCatch.cloneRange();
+            state.richRanges.set(route.doc, range);
+            const selection = getWin(route.doc).getSelection?.();
+            selection?.removeAllRanges();
+            selection?.addRange(range);
           }
         } catch (_) {}
       };
 
       const cleanup = () => {
+        const restoreFocus = catcherDoc.activeElement === catcher && documentHasFocus(catcherDoc);
         try {
           catcher.removeEventListener("paste", onCatcherPaste, true);
         } catch (_) {}
@@ -2436,6 +2308,7 @@
           state.activePasteSession = null;
         }
 
+        if (!restoreFocus) return false;
         restoreSavedRange();
 
         try {
@@ -2444,6 +2317,7 @@
 
         focusRichDoc(route.doc, route.el);
         ensureRichRange(route.doc, route.el);
+        return true;
       };
 
       const finish = text => {
@@ -2453,7 +2327,7 @@
         if (!text) return;
 
         session.done = true;
-        cleanup();
+        if (!cleanup()) return;
 
         if (!isRecentDuplicate(text)) {
           insertByRoute(route, text);
@@ -2463,10 +2337,12 @@
       function onCatcherPaste(e) {
         const text = getClipboardTextFromEvent(e);
 
-        hardCancel(e);
-
         if (text) {
+          hardCancel(e);
           finish(text);
+        } else {
+          // Let the browser fill the catcher when clipboardData is unavailable.
+          stopOnly(e);
         }
       }
 
@@ -2491,13 +2367,9 @@
       } catch (_) {}
 
       state.addTimer(
-        setTimeout(async () => {
+        setTimeout(() => {
           if (session.done) return;
-
-          const text =
-            catcher.value ||
-            catcher.textContent ||
-            await readClipboardText(catcherWin);
+          const text = catcher.value || catcher.textContent || "";
 
           if (text) {
             finish(text);
@@ -2522,6 +2394,10 @@
 
       const text = getClipboardTextFromEvent(e);
 
+      if (!text) {
+        e.__cxAllowNativePaste = true;
+        return;
+      }
       hardCancel(e);
       state.remember(route);
 
@@ -2532,16 +2408,7 @@
 
       if (isRecentDuplicate(text)) return;
 
-      if (text) {
-        insertByRoute(route, text);
-        return;
-      }
-
-      readClipboardText(eventWindow(e)).then(asyncText => {
-        if (asyncText && !isRecentDuplicate(asyncText)) {
-          insertByRoute(route, asyncText);
-        }
-      });
+      insertByRoute(route, text);
     }
 
     function handleBeforeInputEvent(e) {
@@ -2560,6 +2427,10 @@
         e.data ||
         "";
 
+      if (!text) {
+        e.__cxAllowNativePaste = true;
+        return;
+      }
       hardCancel(e);
       state.remember(route);
 
@@ -2570,16 +2441,7 @@
 
       if (isRecentDuplicate(text)) return;
 
-      if (text) {
-        insertByRoute(route, text);
-        return;
-      }
-
-      readClipboardText(eventWindow(e)).then(asyncText => {
-        if (asyncText && !isRecentDuplicate(asyncText)) {
-          insertByRoute(route, asyncText);
-        }
-      });
+      insertByRoute(route, text);
     }
 
     function handleKeyDownEvent(e) {
@@ -2596,6 +2458,7 @@
 
       if (route.type === "rich") {
         route.el = getDefaultRichHost(route.doc, route.el);
+        if (!ensureRichRange(route.doc, route.el)) return;
         saveRichRange(route.doc);
 
         createPasteCatcher(route);
@@ -2603,19 +2466,8 @@
         return;
       }
 
-      const stamp = Date.now();
-
-      state.addTimer(
-        setTimeout(async () => {
-          if (state.lastInsertAt >= stamp) return;
-
-          const text = await readClipboardText(eventWindow(e));
-
-          if (text && state.lastInsertAt < stamp) {
-            insertByRoute(route, text);
-          }
-        }, 80)
-      );
+      // CodeMirror receives the ordinary paste event; do not perform a delayed
+      // clipboard read that could outlive the user's selected editor.
     }
 
     function handleSelectionChange(e) {
@@ -2631,24 +2483,10 @@
     }
 
     function handleRichActivity(e) {
-      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
-
-      if (!doc?.body) return;
-      if (!state.richDocs.has(doc) && !looksLikeRichDoc(doc)) return;
-      if (isPasteCatcherNode(e?.target)) return;
-      if (isPlainInput(e?.target) || isExplicitlyNonEditable(e?.target)) return;
-
-      const route = {
-        type: "rich",
-        doc,
-        el:
-          closestEditableHost(e?.target) ||
-          getDefaultRichHost(doc, doc.activeElement)
-      };
-
-      patchRichDoc(doc, true);
+      const route = richRouteFromEvent(e);
+      if (!route) return;
       state.remember(route);
-      saveRichRange(doc);
+      saveRichRange(route.doc);
     }
 
     function scanFramesInside(root) {
@@ -3173,10 +3011,11 @@
 
     window.__pasteFromClipboard = async () => {
       const route = activeRoute();
-      const win = route?.type === "rich" ? getWin(route.doc) : window;
+      const snapshot = capturePasteRoute(route);
+      if (!snapshot) return false;
+      const win = route.type === "rich" ? getWin(route.doc) : window;
       const text = await readClipboardText(win);
-
-      return text ? window.__pasteText(text) : false;
+      return text && matchesPasteRoute(snapshot) ? insertByRoute(route, text) : false;
     };
 
     window.__pasteToCodeMirror = (text, index = 0) => {
