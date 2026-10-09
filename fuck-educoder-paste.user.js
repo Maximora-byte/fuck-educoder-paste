@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ✨2026最新可用 - 完美解决【头歌/学习通】禁复制/粘贴问题
 // @namespace    https://github.com/ystemsrx/fuck-educoder-paste
-// @version      3.0.0
+// @version      3.0.1
 // @description  1）阻止网页脚本拦截复制/粘贴/全选等快捷键；2）禁止网页往剪贴板写入“全空白”内容；3）在代码编辑器中粘贴前，如果光标前一段是纯空格/Tab，则先清掉这些缩进，再原样粘贴内容。
 // @author       ystemsrx
 // @match        https://www.educoder.net/*
@@ -299,11 +299,67 @@
       return hasCodeyClass(el);
     }
 
+    // Monaco's hidden textarea is not the document model. execCommand there
+    // can take the typing path and auto-indent every line of a multiline paste.
+    function findMonacoEditor(target) {
+      const el = toElement(target);
+      if (!el?.closest?.(".monaco-editor")) return null;
+      const win = getWin(getDoc(el));
+      try {
+        if (typeof win.monaco?.Selection !== "function") return null;
+        return win.monaco?.editor?.getEditors?.().find(editor =>
+          editor.getDomNode()?.contains(el) && editor.hasTextFocus()
+        ) || null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function insertIntoMonaco(editor, text, Selection) {
+      const model = editor.getModel();
+      const selections = editor.getSelections();
+      // Preserve Monaco's native multicursor semantics rather than guessing
+      // how clipboard content should be distributed among several selections.
+      if (!model || selections?.length !== 1 || editor.getRawOptions().readOnly) {
+        return false;
+      }
+
+      const selection = selections[0];
+      const range = {
+        startLineNumber: selection.startLineNumber,
+        startColumn: selection.startColumn,
+        endLineNumber: selection.endLineNumber,
+        endColumn: selection.endColumn
+      };
+      const empty = range.startLineNumber === range.endLineNumber &&
+        range.startColumn === range.endColumn;
+      const prefix = model.getLineContent(range.startLineNumber)
+        .slice(0, range.startColumn - 1);
+      // Never collapse an existing selection or erase selected code first.
+      if (empty && /^[\t ]+$/.test(prefix)) range.startColumn = 1;
+
+      // executeEdits requires real Selection instances for its end state.
+      // Compute the single replacement's endpoint without internal edit IDs;
+      // Monaco may include unrelated whitespace cleanup in its inverse edits.
+      const lines = text.split(/\r\n|\r|\n/);
+      const endLine = range.startLineNumber + lines.length - 1;
+      const endColumn = lines.length === 1
+        ? range.startColumn + text.length
+        : lines[lines.length - 1].length + 1;
+      const endSelections = [new Selection(endLine, endColumn, endLine, endColumn)];
+
+      editor.pushUndoStop();
+      const inserted = editor.executeEdits("pasteUnlock",
+        [{ range, text, forceMoveMarkers: true }], endSelections);
+      editor.pushUndoStop();
+      return inserted;
+    }
+
     function insertTextAtCursor(target, text) {
       if (!text) return;
 
       const el = toElement(target);
-      if (!el) return;
+      if (!el || el.readOnly || el.disabled) return;
 
       const doc = el.ownerDocument || document;
       const win = doc.defaultView || window;
@@ -393,8 +449,10 @@
           return;
         }
 
+        if (el.readOnly || el.disabled) return;
         if (typeof el.value !== "string") return;
         if (typeof el.selectionStart !== "number") return;
+        if (el.selectionStart !== el.selectionEnd) return;
 
         const val = el.value;
         const start = el.selectionStart;
@@ -457,9 +515,36 @@
     window.addEventListener(
       "paste",
       e => {
+        const target = e.target;
+        const el = toElement(target);
+        if (el?.readOnly || el?.disabled) return;
+        const monacoRoot = el?.closest?.(".monaco-editor");
+        if (monacoRoot) {
+          // A bundled Monaco may not expose its API. Its find/replace widgets
+          // also live inside .monaco-editor, but are not model input fields.
+          const editor = findMonacoEditor(target);
+          if (!editor) return;
+          let raw = "";
+          try {
+            raw = getClipboardTextFromEvent(e);
+          } catch (_) {}
+          // Keep the native path for unavailable/non-text clipboard data.
+          // Never await a clipboard read and paste into a later selection.
+          if (!raw) return;
+          try {
+            const Selection = getWin(getDoc(el)).monaco.Selection;
+            if (!insertIntoMonaco(editor, raw, Selection)) return;
+          } catch (err) {
+            console.warn("[pasteUnlock] Monaco paste failed:", err);
+          }
+          // Also cancel on a failed edit: it may have changed the model before
+          // throwing, so a second native insertion would risk duplicate text.
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          return;
+        }
         e.stopImmediatePropagation();
 
-        const target = e.target;
         if (!target) return;
 
         if (!isCodeEditorLike(target)) {
@@ -1098,17 +1183,38 @@
       } catch (_) {}
 
       try {
-        const attr = lower(el.getAttribute("contenteditable"));
+        const value = el.getAttribute("contenteditable");
+        if (value == null) return false;
+        const attr = lower(value);
         return attr === "true" || attr === "plaintext-only" || attr === "";
       } catch (_) {
         return false;
       }
     }
 
+    function isExplicitlyNonEditable(node) {
+      try {
+        for (let cur = toElement(node); cur; cur = cur.parentElement) {
+          const value = cur.getAttribute?.("contenteditable");
+          if (value == null) continue;
+
+          const attr = lower(value);
+          if (attr === "false") return true;
+          // A nested editable host may explicitly reopen editing.
+          if (attr === "true" || attr === "plaintext-only" || attr === "") {
+            return false;
+          }
+        }
+      } catch (_) {}
+
+      return false;
+    }
+
     function closestEditableHost(node) {
       const start = toElement(node);
       if (!start) return null;
       if (isPlainInput(start)) return null;
+      if (isExplicitlyNonEditable(start)) return null;
 
       try {
         for (
@@ -2075,6 +2181,12 @@
     }
 
     function routeFromEvent(e) {
+      const targetEl = toElement(e?.target);
+      if (isExplicitlyNonEditable(targetEl)) return null;
+      if (isPlainInput(targetEl) && !findCodeMirrorFromElement(targetEl)) {
+        return null;
+      }
+
       const cm = findCodeMirrorFromEvent(e);
 
       if (cm) {
@@ -2154,6 +2266,7 @@
     function shouldNeutralizePasteBlocker(e) {
       try {
         if (!isPasteLikeEvent(e)) return false;
+        if (isExplicitlyNonEditable(e?.target)) return false;
 
         if (
           state.activePasteSession &&
@@ -2180,6 +2293,7 @@
 
         if (!e) return false;
         if (isPasteCatcherNode(e?.target)) return false;
+        if (isExplicitlyNonEditable(e?.target)) return false;
 
         if (type === "keydown" && !isPasteKey(e)) return false;
 
@@ -2522,6 +2636,7 @@
       if (!doc?.body) return;
       if (!state.richDocs.has(doc) && !looksLikeRichDoc(doc)) return;
       if (isPasteCatcherNode(e?.target)) return;
+      if (isPlainInput(e?.target) || isExplicitlyNonEditable(e?.target)) return;
 
       const route = {
         type: "rich",
@@ -3036,7 +3151,7 @@
     };
 
     window.__pastePatchStatus = () => ({
-      version: "3.0.0",
+      version: "3.0.1",
       codeMirrorCount: state.codeMirrors.size,
       richEditorCount: state.richDocs.size,
       lastTarget: state.lastTarget,
@@ -3095,3 +3210,4 @@
     installChaoxingPasteEnhancer();
   }
 })();
+
