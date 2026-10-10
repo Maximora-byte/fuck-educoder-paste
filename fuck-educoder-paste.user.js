@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ✨2026最新可用 - 完美解决【头歌/学习通】禁复制/粘贴问题
 // @namespace    https://github.com/ystemsrx/fuck-educoder-paste
-// @version      3.0.0
+// @version      3.1.0
 // @description  1）阻止网页脚本拦截复制/粘贴/全选等快捷键；2）禁止网页往剪贴板写入“全空白”内容；3）在代码编辑器中粘贴前，如果光标前一段是纯空格/Tab，则先清掉这些缩进，再原样粘贴内容。
 // @author       ystemsrx
 // @match        https://www.educoder.net/*
@@ -299,11 +299,93 @@
       return hasCodeyClass(el);
     }
 
+    // Monaco's hidden textarea is not the document model. execCommand there
+    // can take the typing path and auto-indent every line of a multiline paste.
+    function findMonacoEditor(target) {
+      const el = toElement(target);
+      if (!el?.closest?.(".monaco-editor")) return null;
+      const win = getWin(getDoc(el));
+      try {
+        if (typeof win.monaco?.Selection !== "function") return null;
+        return win.monaco?.editor?.getEditors?.().find(editor =>
+          editor.getDomNode()?.contains(el) && editor.hasTextFocus()
+        ) || null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function insertIntoMonaco(editor, text, Selection) {
+      // An incomplete exposed API must leave the original paste untouched.
+      if (typeof Selection !== "function" ||
+          ["getModel", "getSelections", "getRawOptions", "pushUndoStop", "executeEdits"]
+            .some(name => typeof editor?.[name] !== "function")) return false;
+      const model = editor.getModel();
+      if (!model || ["getValue", "getVersionId", "getLineContent"]
+          .some(name => typeof model[name] !== "function")) return false;
+      const selections = editor.getSelections();
+      // Preserve Monaco's native multicursor semantics rather than guessing
+      // how clipboard content should be distributed among several selections.
+      if (!model || selections?.length !== 1 || editor.getRawOptions().readOnly) {
+        return false;
+      }
+
+      const selection = selections[0];
+      const range = {
+        startLineNumber: selection.startLineNumber,
+        startColumn: selection.startColumn,
+        endLineNumber: selection.endLineNumber,
+        endColumn: selection.endColumn
+      };
+      const empty = range.startLineNumber === range.endLineNumber &&
+        range.startColumn === range.endColumn;
+      const prefix = model.getLineContent(range.startLineNumber)
+        .slice(0, range.startColumn - 1);
+      // Never collapse an existing selection or erase selected code first.
+      if (empty && /^[\t ]+$/.test(prefix)) range.startColumn = 1;
+
+      // executeEdits requires real Selection instances for its end state.
+      // Compute the single replacement's endpoint without internal edit IDs;
+      // Monaco may include unrelated whitespace cleanup in its inverse edits.
+      const lines = text.split(/\r\n|\r|\n/);
+      const endLine = range.startLineNumber + lines.length - 1;
+      const endColumn = lines.length === 1
+        ? range.startColumn + text.length
+        : lines[lines.length - 1].length + 1;
+      const endSelections = [new Selection(endLine, endColumn, endLine, endColumn)];
+
+      // Keep the exact model, not a later model returned after a callback.
+      // A version change also detects a same-text replacement whose content
+      // comparison alone cannot distinguish from a rejected/no-op edit.
+      const beforeValue = model.getValue();
+      const beforeVersion = model.getVersionId();
+      const didMutate = () => {
+        try { if (model.getVersionId() !== beforeVersion) return true; } catch (_) {}
+        try { if (model.getValue() !== beforeValue) return true; } catch (_) {}
+        return false;
+      };
+      editor.pushUndoStop();
+      let inserted = false;
+      try {
+        inserted = editor.executeEdits("pasteUnlock",
+          [{ range, text, forceMoveMarkers: true }], endSelections) === true;
+      } catch (err) {
+        console.warn("[pasteUnlock] Monaco edit failed:", err);
+      } finally {
+        // Close the undo group even if an editor callback throws after writing.
+        // Failure here must not turn a completed edit into a native retry.
+        try { editor.pushUndoStop(); } catch (err) {
+          console.warn("[pasteUnlock] Monaco undo boundary failed:", err);
+        }
+      }
+      return inserted || didMutate();
+    }
+
     function insertTextAtCursor(target, text) {
       if (!text) return;
 
       const el = toElement(target);
-      if (!el) return;
+      if (!el || el.readOnly || el.disabled) return;
 
       const doc = el.ownerDocument || document;
       const win = doc.defaultView || window;
@@ -393,8 +475,10 @@
           return;
         }
 
+        if (el.readOnly || el.disabled) return;
         if (typeof el.value !== "string") return;
         if (typeof el.selectionStart !== "number") return;
+        if (el.selectionStart !== el.selectionEnd) return;
 
         const val = el.value;
         const start = el.selectionStart;
@@ -457,9 +541,36 @@
     window.addEventListener(
       "paste",
       e => {
+        const target = e.target;
+        const el = toElement(target);
+        if (el?.readOnly || el?.disabled) return;
+        const monacoRoot = el?.closest?.(".monaco-editor");
+        if (monacoRoot) {
+          // A bundled Monaco may not expose its API. Its find/replace widgets
+          // also live inside .monaco-editor, but are not model input fields.
+          const editor = findMonacoEditor(target);
+          if (!editor) return;
+          let raw = "";
+          try {
+            raw = getClipboardTextFromEvent(e);
+          } catch (_) {}
+          // Keep the native path for unavailable/non-text clipboard data.
+          // Never await a clipboard read and paste into a later selection.
+          if (!raw) return;
+          try {
+            const Selection = getWin(getDoc(el)).monaco.Selection;
+            if (!insertIntoMonaco(editor, raw, Selection)) return;
+          } catch (err) {
+            console.warn("[pasteUnlock] Monaco paste failed:", err);
+            return;
+          }
+          // Cancel only a successful edit or a verified model mutation.
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          return;
+        }
         e.stopImmediatePropagation();
 
-        const target = e.target;
         if (!target) return;
 
         if (!isCodeEditorLike(target)) {
@@ -1098,46 +1209,46 @@
       } catch (_) {}
 
       try {
-        const attr = lower(el.getAttribute("contenteditable"));
+        const value = el.getAttribute("contenteditable");
+        if (value == null) return false;
+        const attr = lower(value);
         return attr === "true" || attr === "plaintext-only" || attr === "";
       } catch (_) {
         return false;
       }
     }
 
-    function closestEditableHost(node) {
-      const start = toElement(node);
-      if (!start) return null;
-      if (isPlainInput(start)) return null;
-
+    function isExplicitlyNonEditable(node) {
       try {
-        for (
-          let cur = start;
-          cur && cur.nodeType === 1;
-          cur = cur.parentElement
-        ) {
-          if (isPlainInput(cur)) return null;
-          if (isEditableElement(cur)) return cur;
+        for (let cur = toElement(node); cur; cur = cur.parentElement) {
+          const value = cur.getAttribute?.("contenteditable");
+          if (value == null) continue;
 
-          const cls = lower(cur.className);
-          const id = lower(cur.id);
-          const role = lower(cur.getAttribute?.("role"));
-
-          if (
-            role === "textbox" ||
-            cls.includes("edui-body-container") ||
-            cls.includes("cke_editable") ||
-            cls.includes("ql-editor") ||
-            cls.includes("w-e-text") ||
-            id.includes("ueditor") ||
-            id.includes("edui")
-          ) {
-            return cur;
+          const attr = lower(value);
+          if (attr === "false") return true;
+          // A nested editable host may explicitly reopen editing.
+          if (attr === "true" || attr === "plaintext-only" || attr === "") {
+            return false;
           }
         }
       } catch (_) {}
 
-      return null;
+      return false;
+    }
+
+    function closestEditableHost(node) {
+      const start = toElement(node);
+      if (!start || isPlainInput(start) || isExplicitlyNonEditable(start)) return null;
+
+      let host = null;
+      try {
+        for (let cur = start; cur && cur.nodeType === 1; cur = cur.parentElement) {
+          if (isPlainInput(cur) || lower(cur.getAttribute?.("contenteditable")) === "false") break;
+          if (isEditableElement(cur)) host = cur;
+          else if (host) break;
+        }
+      } catch (_) {}
+      return host;
     }
 
     function findCodeMirrorFromElement(el) {
@@ -1175,196 +1286,90 @@
     }
 
     function findCodeMirrorFromEvent(e) {
-      for (const node of eventPath(e)) {
-        const cm = findCodeMirrorFromElement(node);
-        if (cm) return cm;
+      // Only the actual event target identifies the editor. Other frames may
+      // retain activeElement, and a recently used editor is not a paste target.
+      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
+      if (!e?.target?.nodeType || e.target.nodeType === 9) {
+        if (!documentHasFocus(doc)) return null;
       }
-
-      for (const cm of state.codeMirrors) {
-        try {
-          const wrapper = cm.getWrapperElement?.();
-          const active = wrapper?.ownerDocument?.activeElement;
-
-          if (
-            wrapper &&
-            active &&
-            (wrapper === active || wrapper.contains(active))
-          ) {
-            return cm;
-          }
-
-          const input = cm.getInputField?.();
-
-          if (input && active === input) {
-            return cm;
-          }
-        } catch (_) {}
-      }
-
-      if (
-        state.lastTarget?.type === "codemirror" &&
-        Date.now() - state.lastTargetAt < 60000
-      ) {
-        return state.lastTarget.cm;
-      }
-
-      return null;
+      return findCodeMirrorFromElement(e?.target);
     }
 
-    function withTemporaryReadWrite(cm, fn) {
-      let oldReadOnly;
-      let changed = false;
-
-      try {
-        if (cm.getOption && cm.setOption) {
-          oldReadOnly = cm.getOption("readOnly");
-
-          if (oldReadOnly) {
-            cm.setOption("readOnly", false);
-            changed = true;
-          }
-        }
-
-        return fn();
-      } finally {
-        if (changed) {
-          try {
-            cm.setOption("readOnly", oldReadOnly);
-          } catch (_) {}
-        }
-      }
-    }
-
-    function withMutedCodeMirrorBeforeChange(cm, doc, fn) {
-      const saved = [];
-
-      for (const obj of [cm, doc]) {
-        try {
-          if (obj?._handlers?.beforeChange) {
-            saved.push([obj, obj._handlers.beforeChange]);
-            obj._handlers.beforeChange = [];
-          }
-        } catch (_) {}
-      }
-
-      try {
-        return fn();
-      } finally {
-        for (const [obj, handlers] of saved) {
-          try {
-            obj._handlers.beforeChange = handlers;
-          } catch (_) {}
-        }
-      }
-    }
-
-    function replaceInCodeMirror(cm, text, muted) {
+    function replaceInCodeMirror(cm, text) {
+      // Respect author read-only settings and beforeChange validators. Never
+      // rewrite options or private handlers to force a cancelled edit through.
+      if (typeof cm.getOption !== "function" || cm.getOption("readOnly")) return false;
       const doc = cm.getDoc ? cm.getDoc() : cm.doc;
-      if (!doc) return false;
-
+      if (!doc || typeof doc.getValue !== "function") return false;
       const before = doc.getValue();
-
+      const selectionState = () => {
+        if (typeof cm.listSelections === "function") return JSON.stringify(cm.listSelections());
+        if (typeof doc.getCursor === "function") {
+          return JSON.stringify([doc.getCursor("from"), doc.getCursor("to")]);
+        }
+        return null;
+      };
+      const beforeSelection = selectionState();
+      let changed = false;
+      let rangeStart = null;
+      let appliedChange = null;
+      const onChange = (_editor, change) => { changed = true; appliedChange = change; };
+      const observesChanges = typeof cm.on === "function" && typeof cm.off === "function";
       const run = () => {
-        if (
-          typeof cm.replaceSelections === "function" &&
-          typeof cm.listSelections === "function" &&
-          cm.listSelections().length > 1
-        ) {
-          cm.replaceSelections(
-            cm.listSelections().map(() => text),
-            "end",
-            "+input"
-          );
-          return;
-        }
-
-        if (typeof cm.replaceSelection === "function") {
-          cm.replaceSelection(text, "end", "+input");
-          return;
-        }
-
-        if (typeof doc.replaceSelection === "function") {
-          doc.replaceSelection(text, "end", "+input");
-          return;
-        }
-
-        if (
-          typeof doc.replaceRange === "function" &&
-          typeof doc.getCursor === "function"
-        ) {
-          const cursor = doc.getCursor();
-          doc.replaceRange(text, cursor, cursor, "+input");
+        const selections = cm.listSelections?.();
+        if (selections?.length > 1) {
+          if (typeof cm.replaceSelections !== "function") return;
+          cm.replaceSelections(selections.map(() => text), "end", "paste");
+        } else if (typeof cm.replaceSelection === "function") {
+          cm.replaceSelection(text, "end", "paste");
+        } else if (typeof doc.replaceSelection === "function") {
+          doc.replaceSelection(text, "end", "paste");
+        } else if (typeof doc.replaceRange === "function" && typeof doc.getCursor === "function") {
+          // getCursor() alone discards the selected span, especially backwards selections.
+          const from = doc.getCursor("from");
+          const to = doc.getCursor("to");
+          if (from && to) {
+            rangeStart = { line: from.line, ch: from.ch };
+            doc.replaceRange(text, from, to, "paste");
+          }
         }
       };
-
-      withTemporaryReadWrite(cm, () => {
-        if (muted) {
-          withMutedCodeMirrorBeforeChange(cm, doc, () => {
-            if (typeof cm.operation === "function") {
-              cm.operation(run);
-            } else {
-              run();
-            }
-          });
-        } else if (typeof cm.operation === "function") {
-          cm.operation(run);
-        } else {
-          run();
+      try {
+        if (observesChanges) cm.on("change", onChange);
+        if (typeof cm.operation === "function") cm.operation(run);
+        else run();
+      } catch (_) {
+        // A site change listener can throw after the model was already edited.
+        // Verify the result below rather than allowing a second native paste.
+      } finally {
+        if (observesChanges) { try { cm.off("change", onChange); } catch (_) {} }
+      }
+      // Same-text replacements may only collapse the selection. A cancelled
+      // beforeChange leaves both content and selection intact; never retry it.
+      let inserted = changed;
+      try { inserted = inserted || doc.getValue() !== before || selectionState() !== beforeSelection; } catch (_) {}
+      if (inserted) {
+        if (rangeStart && typeof doc.setCursor === "function" &&
+            appliedChange?.from && Array.isArray(appliedChange.text) && appliedChange.text.length) {
+          // Public change data reflects any beforeChange text transformation.
+          // Without it, retain the editor's own selection mapping rather than guess.
+          const lines = appliedChange.text;
+          const from = appliedChange.from;
+          const end = { line: from.line + lines.length - 1,
+            ch: lines.length === 1 ? from.ch + lines[0].length : lines[lines.length - 1].length };
+          try { doc.setCursor(end); } catch (_) {}
         }
-      });
-
-      try {
-        cm.save?.();
-      } catch (_) {}
-
-      try {
-        cm.refresh?.();
-      } catch (_) {}
-
-      try {
-        const win =
-          cm.getWrapperElement?.()?.ownerDocument?.defaultView || window;
-
-        dispatchBasicEvents(cm.getInputField?.(), win);
-        dispatchBasicEvents(cm.getTextArea?.(), win);
-      } catch (_) {}
-
-      return doc.getValue() !== before;
+        try { cm.save?.(); } catch (_) {}
+      }
+      return inserted;
     }
 
     function insertIntoCodeMirror(cm, text) {
       text = String(text ?? "");
-
       if (!cm || !text) return false;
-
-      try {
-        cm.focus?.();
-      } catch (_) {}
-
       let ok = false;
-
-      try {
-        ok = replaceInCodeMirror(cm, text, false);
-      } catch (_) {}
-
-      if (!ok) {
-        try {
-          ok = replaceInCodeMirror(cm, text, true);
-        } catch (_) {
-          ok = false;
-        }
-      }
-
-      if (ok) {
-        state.markInserted(
-          {
-            type: "codemirror",
-            cm
-          },
-          text
-        );
-      }
-
+      try { ok = replaceInCodeMirror(cm, text); } catch (_) {}
+      if (ok) state.markInserted({ type: "codemirror", cm }, text);
       return ok;
     }
 
@@ -1530,9 +1535,8 @@
 
         const range = sel.getRangeAt(0);
 
-        if (!rangeBelongsToDoc(range, doc)) {
-          return false;
-        }
+        const host = getDefaultRichHost(doc);
+        if (!rangeBelongsToRichHost(range, doc, host)) return false;
 
         state.richRanges.set(doc, range.cloneRange());
         return true;
@@ -1541,20 +1545,44 @@
       }
     }
 
-    function getDefaultRichHost(doc, preferred) {
-      if (
-        preferred &&
-        preferred.ownerDocument === doc &&
-        !isPlainInput(preferred) &&
-        !isPasteCatcherNode(preferred)
-      ) {
-        return preferred;
+    function documentHasFocus(doc) {
+      try {
+        if (doc?.hasFocus?.() !== true) return false;
+        let frame = getFrameElement(getWin(doc));
+        while (frame) {
+          if (frame.isConnected === false || frame.ownerDocument?.activeElement !== frame) return false;
+          frame = getFrameElement(getWin(frame.ownerDocument));
+        }
+        return true;
+      } catch (_) {
+        return false;
       }
+    }
 
-      const activeHost = closestEditableHost(doc?.activeElement);
-      if (activeHost && !isPasteCatcherNode(activeHost)) return activeHost;
+    function getDefaultRichHost(doc, preferred) {
+      if (!doc?.body) return null;
+      if (!preferred && !documentHasFocus(doc)) return null;
+      const el = toElement(preferred || doc.activeElement);
+      if (!el || el.ownerDocument !== doc || el.isConnected === false ||
+          isPlainInput(el) || isPasteCatcherNode(el) || isExplicitlyNonEditable(el)) return null;
 
-      return doc?.body || null;
+      // Whole-document editing is still confined to visible body content.
+      if (el !== doc.body && !doc.body.contains(el)) return null;
+      if (lower(doc.designMode) === "on") return doc.body;
+      const host = closestEditableHost(el);
+      return host === doc.documentElement ? doc.body : host;
+    }
+
+    function rangeBelongsToRichHost(range, doc, host) {
+      if (!host || !rangeBelongsToDoc(range, doc)) return false;
+      try {
+        return [range.startContainer, range.endContainer].every(node =>
+          node && (node === host || host.contains(node)) &&
+          getDefaultRichHost(doc, toElement(node)) === host
+        );
+      } catch (_) {
+        return false;
+      }
     }
 
     function focusRichDoc(doc, preferredHost) {
@@ -1563,6 +1591,7 @@
       const win = getWin(doc);
       const frame = getFrameElement(win);
       const host = getDefaultRichHost(doc, preferredHost);
+      if (!host) return;
 
       try {
         frame?.focus?.({ preventScroll: true });
@@ -1575,8 +1604,6 @@
       try {
         if (host && typeof host.focus === "function") {
           host.focus({ preventScroll: true });
-        } else {
-          doc.body.focus?.({ preventScroll: true });
         }
       } catch (_) {}
 
@@ -1587,40 +1614,31 @@
 
     function ensureRichRange(doc, preferredHost) {
       if (!doc?.body) return null;
-
+      const host = getDefaultRichHost(doc, preferredHost);
+      if (!host) return null;
       const win = getWin(doc);
-      const host = getDefaultRichHost(doc, preferredHost) || doc.body;
-
-      focusRichDoc(doc, host);
 
       try {
         const sel = win.getSelection?.();
         if (!sel) return null;
-
+        // The caret may have moved before selectionchange has been delivered.
+        if (sel.rangeCount > 0) {
+          const current = sel.getRangeAt(0);
+          if (!rangeBelongsToRichHost(current, doc, host)) return null;
+          state.richRanges.set(doc, current.cloneRange());
+          return current;
+        }
         const saved = state.richRanges.get(doc);
-
-        if (saved && rangeBelongsToDoc(saved, doc)) {
+        if (saved && rangeBelongsToRichHost(saved, doc, host)) {
           sel.removeAllRanges();
           sel.addRange(saved);
           return saved;
         }
-
-        if (sel.rangeCount > 0) {
-          const current = sel.getRangeAt(0);
-
-          if (rangeBelongsToDoc(current, doc)) {
-            state.richRanges.set(doc, current.cloneRange());
-            return current;
-          }
-        }
-
         const range = doc.createRange();
-        range.selectNodeContents(host || doc.body);
+        range.selectNodeContents(host);
         range.collapse(false);
-
         sel.removeAllRanges();
         sel.addRange(range);
-
         state.richRanges.set(doc, range.cloneRange());
         return range;
       } catch (_) {
@@ -1724,9 +1742,7 @@
         let block = findBlockForRange(range, host, doc);
 
         if (!block) {
-          block =
-            findSingleEmptyBlockInHost(host || doc.body) ||
-            findSingleEmptyBlockInHost(doc.body);
+          block = findSingleEmptyBlockInHost(host);
         }
 
         if (!block || block === doc.body || !isVisuallyEmptyBlock(block)) {
@@ -1755,11 +1771,10 @@
       }
     }
 
-    function findUEditorByDoc(doc) {
+    function findUEditorByDoc(doc, host) {
       if (!doc) return null;
 
       const win = getWin(doc);
-      const frame = getFrameElement(win);
       const candidates = [];
 
       const pushUE = UE => {
@@ -1792,36 +1807,20 @@
         pushUE(top?.UE);
       } catch (_) {}
 
-      const possibleIds = new Set();
-
-      try {
-        for (const id of [frame?.id, frame?.name]) {
-          if (!id) continue;
-
-          possibleIds.add(id);
-          possibleIds.add(String(id).replace(/_iframe$/i, ""));
-          possibleIds.add(String(id).replace(/^ueditor_/i, ""));
-        }
-      } catch (_) {}
-
+      // Registry lookup is read-only. UE.getEditor(id) creates an editor and
+      // a guessed frame name is not proof that an instance owns this document.
       for (const UE of candidates) {
-        for (const id of possibleIds) {
-          try {
-            if (id && typeof UE.getEditor === "function") {
-              const editor = UE.getEditor(id);
-              if (editor) return editor;
-            }
-          } catch (_) {}
-        }
-
         try {
-          const instances = UE.instants || UE.instances || UE._instances || {};
+          const instances = new Set([UE.instants, UE.instances, UE._instances]
+            .filter(Boolean).flatMap(registry => Object.values(registry)));
 
-          for (const key in instances) {
-            const editor = instances[key];
+          for (const editor of instances) {
 
             try {
               const iframe = editor?.iframe || editor?._iframe;
+              // Inline editors can share a document. Document identity alone
+              // must not send commands or synchronization to a sibling host.
+              if (host && (editor?.body ? editor.body !== host : host !== doc.body)) continue;
 
               if (
                 editor?.document === doc ||
@@ -1842,7 +1841,7 @@
 
     function syncRichEditor(doc, host) {
       const win = getWin(doc);
-      const editor = findUEditorByDoc(doc);
+      const editor = findUEditorByDoc(doc, host);
 
       if (editor) {
         try {
@@ -1895,9 +1894,9 @@
 
     function insertHTMLByRange(route, html) {
       const doc = route.doc;
-      const host = getDefaultRichHost(doc, route.el) || doc.body;
+      const host = getDefaultRichHost(doc, route.el);
 
-      if (!doc?.body || html == null) return false;
+      if (!host || html == null) return false;
 
       const before = doc.body.innerHTML;
 
@@ -1909,14 +1908,7 @@
 
         let range = ensureRichRange(doc, host);
 
-        if (!range || !rangeBelongsToDoc(range, doc)) {
-          range = doc.createRange();
-          range.selectNodeContents(host || doc.body);
-          range.collapse(false);
-
-          sel.removeAllRanges();
-          sel.addRange(range);
-        }
+        if (!rangeBelongsToRichHost(range, doc, host)) return false;
 
         range = normalizeRangeBeforeRichInsert(doc, range, host);
 
@@ -1954,24 +1946,75 @@
       }
     }
 
+    function insertIntoUEditor(route, html) {
+      if (!isCurrentRoute(route)) return false;
+      const { doc, el: host } = route;
+      const range = ensureRichRange(doc, host);
+      if (!rangeBelongsToRichHost(range, doc, host)) return false;
+      const editor = findUEditorByDoc(doc, host);
+      if (!editor || typeof editor.execCommand !== "function" ||
+          typeof editor.queryCommandState !== "function" ||
+          editor.queryCommandState("insertHTML") === -1) return false;
+      const editorRange = editor.selection?.getRange?.();
+      if (!editorRange || typeof editorRange.setStart !== "function" ||
+          typeof editorRange.setEnd !== "function" || typeof editorRange.select !== "function") return false;
+      // UEditor's command owns its undo history and contentchange events.
+      // Populate its range from the already verified live DOM selection.
+      editorRange.setStart(range.startContainer, range.startOffset);
+      editorRange.setEnd(range.endContainer, range.endOffset);
+      editorRange.select();
+      if (!isCurrentRoute(route)) return false;
+      const before = host.innerHTML;
+      const start = range.startContainer, end = range.endContainer;
+      const startOffset = range.startOffset, endOffset = range.endOffset;
+      let result;
+      try { result = editor.execCommand("insertHTML", html); } catch (_) {}
+      // Some site callbacks throw after applying the command; mutation wins
+      // over the return value so native paste cannot duplicate the edit.
+      const selection = getWin(doc).getSelection?.();
+      const after = selection?.rangeCount === 1 ? selection.getRangeAt(0) : null;
+      const changed = host.innerHTML !== before || (after &&
+        (after.startContainer !== start || after.endContainer !== end ||
+         after.startOffset !== startOffset || after.endOffset !== endOffset));
+      if (result === false && !changed) return false;
+      if (changed) { try { editor.sync?.(); } catch (_) {} }
+      return !!changed;
+    }
+
     function insertIntoRichEditor(route, text) {
       text = String(text ?? "");
 
-      if (!route?.doc?.body || !text) return false;
+      if (!route?.doc?.body || !text || !isCurrentRoute(route)) return false;
 
       const doc = route.doc;
-      const host = getDefaultRichHost(doc, route.el) || doc.body;
+      const host = getDefaultRichHost(doc, route.el);
+      if (!host) return false;
 
       route.el = host;
+      const range = ensureRichRange(doc, host);
+      if (!rangeBelongsToRichHost(range, doc, host)) return false;
 
       patchRichDoc(doc, true);
 
       state.remember(route);
-      focusRichDoc(doc, host);
-      ensureRichRange(doc, host);
 
       const html = plainTextToRichHTML(text);
-      const ok = insertHTMLByRange(route, html);
+      let ok = false;
+      try {
+        // A known UEditor must use its command API; falling back to direct DOM
+        // insertion after a disabled/cancelled command would bypass its policy.
+        if (findUEditorByDoc(doc, host)) ok = insertIntoUEditor(route, html);
+        else if (typeof doc.execCommand === "function") {
+          const command = lower(host.getAttribute?.("contenteditable")) === "plaintext-only"
+            ? "insertText" : "insertHTML";
+          const before = host.innerHTML;
+          const beforeSelection = capturePasteRoute(route);
+          try { ok = doc.execCommand(command, false, command === "insertText" ? text : html); } catch (_) {}
+          ok = !!ok || host.innerHTML !== before ||
+            (!!beforeSelection && !matchesPasteRoute(beforeSelection));
+          if (ok) syncRichEditor(doc, host);
+        }
+      } catch (_) {}
 
       if (ok) {
         state.markInserted(route, text);
@@ -1982,99 +2025,24 @@
     }
 
     function richRouteFromEvent(e) {
-      for (const node of eventPath(e)) {
-        if (isPasteCatcherNode(node)) return null;
-
-        const el = toElement(node);
-
-        if (isPlainInput(el)) {
-          return null;
-        }
-
-        const doc = getDoc(node);
-        if (!doc?.body) continue;
-
-        const host = closestEditableHost(node);
-
-        if (host) {
-          patchRichDoc(doc, true);
-
-          return {
-            type: "rich",
-            doc,
-            el: host
-          };
-        }
-
-        if (state.richDocs.has(doc)) {
-          return {
-            type: "rich",
-            doc,
-            el: getDefaultRichHost(doc, doc.activeElement)
-          };
-        }
-
-        if (looksLikeRichDoc(doc)) {
-          patchRichDoc(doc, true);
-
-          return {
-            type: "rich",
-            doc,
-            el: getDefaultRichHost(doc, doc.activeElement)
-          };
-        }
+      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
+      if (!doc?.body) return null;
+      if (!e?.target?.nodeType || e.target.nodeType === 9) {
+        if (!documentHasFocus(doc)) return null;
       }
-
-      for (const doc of state.richDocs) {
-        try {
-          const host = closestEditableHost(doc.activeElement);
-
-          if (host) {
-            return {
-              type: "rich",
-              doc,
-              el: host
-            };
-          }
-
-          if (doc.hasFocus?.()) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-
-          const frame = getFrameElement(getWin(doc));
-
-          if (frame && frame.ownerDocument?.activeElement === frame) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-        } catch (_) {}
-      }
-
-      return null;
-    }
-
-    function shouldUseLastRichRoute(e) {
-      if (!isPasteLikeEvent(e)) return false;
-      if (!state.lastTarget || state.lastTarget.type !== "rich") return false;
-      if (Date.now() - state.lastTargetAt > 180000) return false;
-
-      const targetEl = toElement(e?.target);
-
-      if (isPlainInput(targetEl) || isPasteCatcherNode(targetEl)) {
-        return false;
-      }
-
-      return true;
+      const host = getDefaultRichHost(doc, toElement(e?.target));
+      if (!host) return null;
+      patchRichDoc(doc, true);
+      return { type: "rich", doc, el: host };
     }
 
     function routeFromEvent(e) {
+      const targetEl = toElement(e?.target);
+      if (isExplicitlyNonEditable(targetEl)) return null;
+      if (isPlainInput(targetEl) && !findCodeMirrorFromElement(targetEl)) {
+        return null;
+      }
+
       const cm = findCodeMirrorFromEvent(e);
 
       if (cm) {
@@ -2087,10 +2055,6 @@
       const rich = richRouteFromEvent(e);
       if (rich) return rich;
 
-      if (shouldUseLastRichRoute(e)) {
-        return state.lastTarget;
-      }
-
       return null;
     }
 
@@ -2098,65 +2062,76 @@
       for (const cm of state.codeMirrors) {
         try {
           const wrapper = cm.getWrapperElement?.();
-          const active = wrapper?.ownerDocument?.activeElement;
-
-          if (
-            wrapper &&
-            active &&
-            (wrapper === active || wrapper.contains(active))
-          ) {
-            return {
-              type: "codemirror",
-              cm
-            };
-          }
-
-          const input = cm.getInputField?.();
-
-          if (input && active === input) {
-            return {
-              type: "codemirror",
-              cm
-            };
+          const doc = wrapper?.ownerDocument;
+          if (wrapper?.isConnected === false || !documentHasFocus(doc)) continue;
+          const active = doc.activeElement;
+          if (active && (wrapper === active || wrapper.contains(active) || cm.getInputField?.() === active)) {
+            return { type: "codemirror", cm };
           }
         } catch (_) {}
       }
-
       for (const doc of state.richDocs) {
-        try {
-          const host = closestEditableHost(doc.activeElement);
-
-          if (host) {
-            return {
-              type: "rich",
-              doc,
-              el: host
-            };
-          }
-
-          if (doc.hasFocus?.()) {
-            return {
-              type: "rich",
-              doc,
-              el: getDefaultRichHost(doc, doc.activeElement)
-            };
-          }
-        } catch (_) {}
+        const host = getDefaultRichHost(doc);
+        if (host) return { type: "rich", doc, el: host };
       }
-
-      if (state.lastTarget && Date.now() - state.lastTargetAt < 180000) {
-        return state.lastTarget;
-      }
-
       return null;
+    }
+
+    function isCurrentRoute(route) {
+      if (route?.type === "rich") {
+        return getDefaultRichHost(route.doc) === route.el;
+      }
+      if (route?.type !== "codemirror") return false;
+      try {
+        const wrapper = route.cm.getWrapperElement?.();
+        const doc = wrapper?.ownerDocument;
+        if (!wrapper || wrapper.isConnected === false || !documentHasFocus(doc)) return false;
+        const active = doc.activeElement;
+        return !!active && (wrapper === active || wrapper.contains(active) || route.cm.getInputField?.() === active);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function capturePasteRoute(route) {
+      if (!isCurrentRoute(route)) return null;
+      try {
+        if (route.type === "rich") {
+          const selection = getWin(route.doc).getSelection?.();
+          if (selection?.rangeCount !== 1) return null;
+          const range = selection.getRangeAt(0);
+          if (!rangeBelongsToRichHost(range, route.doc, route.el)) return null;
+          return { route, start: range.startContainer, startOffset: range.startOffset,
+            end: range.endContainer, endOffset: range.endOffset };
+        }
+        const cm = route.cm;
+        if (typeof cm.listSelections !== "function") return null;
+        const selections = cm.listSelections();
+        if (!selections?.length) return null;
+        const positions = selections.map(({ anchor, head }) => [anchor.line, anchor.ch, head.line, head.ch]);
+        return { route, model: cm.getDoc?.() || cm.doc, positions: JSON.stringify(positions) };
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function matchesPasteRoute(snapshot) {
+      const current = snapshot && capturePasteRoute(snapshot.route);
+      if (!current) return false;
+      if (snapshot.route.type === "rich") {
+        return current.start === snapshot.start && current.startOffset === snapshot.startOffset &&
+          current.end === snapshot.end && current.endOffset === snapshot.endOffset;
+      }
+      return current.model === snapshot.model && current.positions === snapshot.positions;
     }
 
     function shouldNeutralizePasteBlocker(e) {
       try {
-        if (!isPasteLikeEvent(e)) return false;
+        if (!isPasteLikeEvent(e) || e.__cxAllowNativePaste) return false;
+        if (isExplicitlyNonEditable(e?.target)) return false;
 
         if (
-          state.activePasteSession &&
+          state.activePasteSession?.catcher === toElement(e?.target) &&
           Date.now() - state.activePasteSession.startedAt < 2000
         ) {
           return true;
@@ -2168,7 +2143,9 @@
           return false;
         }
 
-        return !!routeFromEvent(e);
+        const route = routeFromEvent(e);
+        if (route?.type === "codemirror" && route.cm.getOption?.("readOnly")) return false;
+        return !!route;
       } catch (_) {
         return false;
       }
@@ -2178,8 +2155,9 @@
       try {
         type = lower(type);
 
-        if (!e) return false;
+        if (!e || e.__cxAllowNativePaste) return false;
         if (isPasteCatcherNode(e?.target)) return false;
+        if (isExplicitlyNonEditable(e?.target)) return false;
 
         if (type === "keydown" && !isPasteKey(e)) return false;
 
@@ -2204,15 +2182,8 @@
         }
 
         const route = routeFromEvent(e);
-        if (route) return true;
-
-        const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
-        if (!doc?.body) return false;
-
-        if (state.richDocs.has(doc) || looksLikeRichDoc(doc)) {
-          patchRichDoc(doc, true);
-          return true;
-        }
+        if (route?.type === "codemirror" && route.cm.getOption?.("readOnly")) return false;
+        return !!route;
       } catch (_) {}
 
       return false;
@@ -2227,7 +2198,7 @@
     }
 
     function insertByRoute(route, text) {
-      if (!route || !text) return false;
+      if (!route || !text || !isCurrentRoute(route)) return false;
 
       state.remember(route);
 
@@ -2259,7 +2230,6 @@
       })();
 
       const catcherDoc = route.doc || document;
-      const catcherWin = getWin(catcherDoc);
       const oldActive = catcherDoc.activeElement;
 
       const session = {
@@ -2295,17 +2265,19 @@
         try {
           if (
             savedRangeBeforeCatch &&
-            rangeBelongsToDoc(savedRangeBeforeCatch, route.doc)
+            rangeBelongsToRichHost(savedRangeBeforeCatch, route.doc, getDefaultRichHost(route.doc, route.el))
           ) {
-            state.richRanges.set(
-              route.doc,
-              savedRangeBeforeCatch.cloneRange()
-            );
+            const range = savedRangeBeforeCatch.cloneRange();
+            state.richRanges.set(route.doc, range);
+            const selection = getWin(route.doc).getSelection?.();
+            selection?.removeAllRanges();
+            selection?.addRange(range);
           }
         } catch (_) {}
       };
 
       const cleanup = () => {
+        const restoreFocus = catcherDoc.activeElement === catcher && documentHasFocus(catcherDoc);
         try {
           catcher.removeEventListener("paste", onCatcherPaste, true);
         } catch (_) {}
@@ -2322,6 +2294,7 @@
           state.activePasteSession = null;
         }
 
+        if (!restoreFocus) return false;
         restoreSavedRange();
 
         try {
@@ -2330,6 +2303,7 @@
 
         focusRichDoc(route.doc, route.el);
         ensureRichRange(route.doc, route.el);
+        return true;
       };
 
       const finish = text => {
@@ -2339,7 +2313,7 @@
         if (!text) return;
 
         session.done = true;
-        cleanup();
+        if (!cleanup()) return;
 
         if (!isRecentDuplicate(text)) {
           insertByRoute(route, text);
@@ -2349,10 +2323,12 @@
       function onCatcherPaste(e) {
         const text = getClipboardTextFromEvent(e);
 
-        hardCancel(e);
-
         if (text) {
+          hardCancel(e);
           finish(text);
+        } else {
+          // Let the browser fill the catcher when clipboardData is unavailable.
+          stopOnly(e);
         }
       }
 
@@ -2377,13 +2353,9 @@
       } catch (_) {}
 
       state.addTimer(
-        setTimeout(async () => {
+        setTimeout(() => {
           if (session.done) return;
-
-          const text =
-            catcher.value ||
-            catcher.textContent ||
-            await readClipboardText(catcherWin);
+          const text = catcher.value || catcher.textContent || "";
 
           if (text) {
             finish(text);
@@ -2408,26 +2380,13 @@
 
       const text = getClipboardTextFromEvent(e);
 
-      hardCancel(e);
-      state.remember(route);
-
-      if (route.type === "rich") {
-        route.el = getDefaultRichHost(route.doc, route.el);
-        ensureRichRange(route.doc, route.el);
-      }
-
-      if (isRecentDuplicate(text)) return;
-
-      if (text) {
-        insertByRoute(route, text);
+      if (!text) {
+        e.__cxAllowNativePaste = true;
         return;
       }
-
-      readClipboardText(eventWindow(e)).then(asyncText => {
-        if (asyncText && !isRecentDuplicate(asyncText)) {
-          insertByRoute(route, asyncText);
-        }
-      });
+      state.remember(route);
+      if (insertByRoute(route, text)) hardCancel(e);
+      else e.__cxAllowNativePaste = true;
     }
 
     function handleBeforeInputEvent(e) {
@@ -2446,26 +2405,13 @@
         e.data ||
         "";
 
-      hardCancel(e);
-      state.remember(route);
-
-      if (route.type === "rich") {
-        route.el = getDefaultRichHost(route.doc, route.el);
-        ensureRichRange(route.doc, route.el);
-      }
-
-      if (isRecentDuplicate(text)) return;
-
-      if (text) {
-        insertByRoute(route, text);
+      if (!text) {
+        e.__cxAllowNativePaste = true;
         return;
       }
-
-      readClipboardText(eventWindow(e)).then(asyncText => {
-        if (asyncText && !isRecentDuplicate(asyncText)) {
-          insertByRoute(route, asyncText);
-        }
-      });
+      state.remember(route);
+      if (insertByRoute(route, text)) hardCancel(e);
+      else e.__cxAllowNativePaste = true;
     }
 
     function handleKeyDownEvent(e) {
@@ -2480,28 +2426,9 @@
 
       state.remember(route);
 
-      if (route.type === "rich") {
-        route.el = getDefaultRichHost(route.doc, route.el);
-        saveRichRange(route.doc);
-
-        createPasteCatcher(route);
-        stopOnly(e);
-        return;
-      }
-
-      const stamp = Date.now();
-
-      state.addTimer(
-        setTimeout(async () => {
-          if (state.lastInsertAt >= stamp) return;
-
-          const text = await readClipboardText(eventWindow(e));
-
-          if (text && state.lastInsertAt < stamp) {
-            insertByRoute(route, text);
-          }
-        }, 80)
-      );
+      // Keep the real editor focused. A hidden catcher cannot return a failed
+      // insertion to the browser's native paste path, so ordinary paste events
+      // are the only automatic insertion path (no delayed clipboard reads).
     }
 
     function handleSelectionChange(e) {
@@ -2517,23 +2444,10 @@
     }
 
     function handleRichActivity(e) {
-      const doc = getDoc(e?.target) || getDoc(e?.currentTarget);
-
-      if (!doc?.body) return;
-      if (!state.richDocs.has(doc) && !looksLikeRichDoc(doc)) return;
-      if (isPasteCatcherNode(e?.target)) return;
-
-      const route = {
-        type: "rich",
-        doc,
-        el:
-          closestEditableHost(e?.target) ||
-          getDefaultRichHost(doc, doc.activeElement)
-      };
-
-      patchRichDoc(doc, true);
+      const route = richRouteFromEvent(e);
+      if (!route) return;
       state.remember(route);
-      saveRichRange(doc);
+      saveRichRange(route.doc);
     }
 
     function scanFramesInside(root) {
@@ -2788,7 +2702,7 @@
       try {
         cm.__forcePasteText = text => {
           remember();
-          return insertIntoCodeMirror(cm, String(text ?? ""));
+          return insertByRoute({ type: "codemirror", cm }, String(text ?? ""));
         };
       } catch (_) {}
     }
@@ -3036,7 +2950,7 @@
     };
 
     window.__pastePatchStatus = () => ({
-      version: "3.0.0",
+      version: "3.1.0",
       codeMirrorCount: state.codeMirrors.size,
       richEditorCount: state.richDocs.size,
       lastTarget: state.lastTarget,
@@ -3058,10 +2972,11 @@
 
     window.__pasteFromClipboard = async () => {
       const route = activeRoute();
-      const win = route?.type === "rich" ? getWin(route.doc) : window;
+      const snapshot = capturePasteRoute(route);
+      if (!snapshot) return false;
+      const win = route.type === "rich" ? getWin(route.doc) : window;
       const text = await readClipboardText(win);
-
-      return text ? window.__pasteText(text) : false;
+      return text && matchesPasteRoute(snapshot) ? insertByRoute(route, text) : false;
     };
 
     window.__pasteToCodeMirror = (text, index = 0) => {
@@ -3069,7 +2984,7 @@
 
       if (!cm) return false;
 
-      return insertIntoCodeMirror(cm, String(text ?? ""));
+      return insertByRoute({ type: "codemirror", cm }, String(text ?? ""));
     };
 
     window.__pasteToRichEditor = (text, index = 0) => {
@@ -3095,3 +3010,4 @@
     installChaoxingPasteEnhancer();
   }
 })();
+
