@@ -2,7 +2,7 @@
 
 基于 [ystemsrx/fuck-educoder-paste](https://github.com/ystemsrx/fuck-educoder-paste) 的 MIT fork。针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1)、[#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)，改进编辑器选区、原文粘贴和错误目标防护。
 
-当前改动在本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1)，尚未合并或发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
+本次改动已于 2026-10-10 通过本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1) 合并到 `master`。这只确认本 fork 的合并状态；尚未确认这些改动已发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
 
 ## 本次升级
 
@@ -19,8 +19,8 @@
 ## 使用候选版
 
 1. 使用你已有的 Tampermonkey / Violentmonkey 等脚本管理器。
-2. 打开当前分支的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/fix/paste-issues-1-2/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
-3. 只在你有权编辑的练习页面刷新并验收。原作者 Greasy Fork 发布版不包含这些未合并改动。
+2. 打开本 fork 默认分支 `master` 的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/master/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
+3. 只在你有权编辑的练习页面刷新并验收。本 fork 的合并不等于原作者 Greasy Fork 发布版已同步；安装前请核对所用脚本来源和版本。
 
 脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`。本次没有新增域名、运行时依赖、网络请求或权限，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。原作者的复制、全选、空白剪贴板写入保护等基础逻辑继续保留。
 
