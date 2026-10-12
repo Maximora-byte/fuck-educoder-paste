@@ -1,10 +1,35 @@
+<a id="top"></a>
+<div align="center">
+
 # 头歌 / 学习通复制粘贴助手：3.1.0 候选版
+
+**保留编辑选区与原文格式，改善有权编辑页面的粘贴体验。**
+
+<sub>Userscript · 人工验收候选版 · MIT fork</sub>
+
+[快速开始](#quick-start) · [升级说明](#changes) · [开发验证](#development) · [验收清单](#acceptance) · [许可](#license)
+
+</div>
+
 
 基于 [ystemsrx/fuck-educoder-paste](https://github.com/ystemsrx/fuck-educoder-paste) 的 MIT fork。针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1)、[#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)，改进编辑器选区、原文粘贴和错误目标防护。
 
-当前改动在本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1)，尚未合并或发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
+本次改动已于 2026-10-10 通过本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1) 合并到 `master`。这只确认本 fork 的合并状态；尚未确认这些改动已发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
 
+<a id="quick-start"></a>
+## 使用候选版
+
+1. 使用你已有的 Tampermonkey / Violentmonkey 等脚本管理器。
+2. 打开本 fork 默认分支 `master` 的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/master/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
+3. 只在你有权编辑的练习页面刷新并验收。本 fork 的合并不等于原作者 Greasy Fork 发布版已同步；安装前请核对所用脚本来源和版本。
+
+脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`。本次没有新增域名、运行时依赖、网络请求或权限，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。原作者的复制、全选、空白剪贴板写入保护等基础逻辑继续保留。
+
+<a id="changes"></a>
 ## 本次升级
+
+<details>
+<summary>展开编辑器适配、选区与原生回退说明</summary>
 
 - **Monaco**：保留 3.0.1 的公开 `executeEdits` + `Selection` 路径、撤销边界和原始多行缩进；在事件发生时发现当前编辑器，避免依赖旧实例。查找框、多光标、只读、未暴露 API 或无事件文本时交回原生流程。
 - **CodeMirror 5 风格 API**：使用 `replaceSelection` / `replaceSelections`；只有 `replaceRange` 时使用完整选区起止位置，并在可用时把光标置于插入末尾。以 `paste` 来源保留编辑器的历史机制，同文本替换也能识别成功。
@@ -16,14 +41,9 @@
 
 动态挂载和切换沿用现有扫描与事件目标发现机制；焦点、iframe 父级焦点和选区端点仍须属于当前可编辑宿主。类名、旧编辑器记录和陈旧选区不作为写入依据。显式异步剪贴板助手仍会校验宿主、选区以及 CodeMirror 模型未改变。
 
-## 使用候选版
+</details>
 
-1. 使用你已有的 Tampermonkey / Violentmonkey 等脚本管理器。
-2. 打开当前分支的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/fix/paste-issues-1-2/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
-3. 只在你有权编辑的练习页面刷新并验收。原作者 Greasy Fork 发布版不包含这些未合并改动。
-
-脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`。本次没有新增域名、运行时依赖、网络请求或权限，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。原作者的复制、全选、空白剪贴板写入保护等基础逻辑继续保留。
-
+<a id="development"></a>
 ## 本地验证
 
 Node.js 18 或更新版本，无需安装依赖：
@@ -40,6 +60,7 @@ node --test tests/*.test.cjs
 - **浏览器夹具未运行通过**：本次环境在 Chromium 启动时拒绝创建进程单例 socket，六个浏览器断言均未执行；仅脚本语法检查通过。真实浏览器撤销栈、扩展注入时序和真实编辑器版本兼容性尚未验证。
 - 没有配置或运行 GitHub Actions。
 
+<a id="acceptance"></a>
 ## 验收清单
 
 在有权编辑的练习页，分别检查：
@@ -53,6 +74,7 @@ node --test tests/*.test.cjs
 
 平台限制在原生回退时仍可能生效。ACE、CodeMirror 6、未暴露 Monaco API 的构建和不同 UEditor 版本没有专门适配或完整验证。反馈问题时请附浏览器、脚本管理器、编辑器类型、复现步骤和脱敏截图，不要提交课程答案或私人数据。
 
+<a id="license"></a>
 ## 设计参考与许可
 
 本次采用独立实现，保留原作者 ystemsrx 的署名和 [MIT LICENSE](LICENSE)，不引入以下项目的运行时代码或附属功能：
@@ -64,3 +86,5 @@ node --test tests/*.test.cjs
 没有复制许可声明冲突的旧 Chaoxing-CopyPaste-Helper，亦未引入其他项目的考试设置修改、签名采集或 AGPL 代码。
 
 仅用于改善合法编辑体验，请遵守平台规则和学术诚信要求。
+
+[返回顶部](#top)
