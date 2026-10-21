@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ✨2026最新可用 - 完美解决【头歌/学习通】禁复制/粘贴问题
 // @namespace    https://github.com/ystemsrx/fuck-educoder-paste
-// @version      3.1.0
+// @version      3.2.1
 // @description  1）阻止网页脚本拦截复制/粘贴/全选等快捷键；2）禁止网页往剪贴板写入“全空白”内容；3）在代码编辑器中粘贴前，如果光标前一段是纯空格/Tab，则先清掉这些缩进，再原样粘贴内容。
 // @author       ystemsrx
 // @match        https://www.educoder.net/*
@@ -14,6 +14,7 @@
 // @match        *://*.chaoxingerya.com/*
 // @match        *://chaoxingerya.com/*
 // @run-at       document-start
+// @sandbox      raw
 // @license      MIT
 // @grant        none
 // ==/UserScript==
@@ -213,11 +214,13 @@
   // 头歌平台：复制 / 粘贴 / 全选解锁 + 编辑器粘贴缩进处理
   // ============================================================
   function installEducoderUnlock() {
-    const VERSION = "3.1.0";
-    const DOC_MARK = "__educoderPasteUnlock310__";
+    const VERSION = "3.2.1";
+    const DOC_MARK = "__educoderPasteUnlock321__";
     const docs = new WeakSet();
     const frames = new WeakSet();
     const monacoEditors = new Set();
+    const trackedEditors = new WeakSet();
+    const editorByRoot = new WeakMap();
     let documentCount = 0;
     let lastRoute = "native";
 
@@ -225,17 +228,105 @@
       return el?.closest?.(".CodeMirror,.monaco-editor,.ace_editor,.cm-editor");
     }
 
+    function rememberEditor(editor) {
+      if (!editor || typeof editor.getDomNode !== "function" ||
+          typeof editor.getModel !== "function" ||
+          typeof editor.executeEdits !== "function" ||
+          typeof editor.getSelections !== "function") return false;
+      try {
+        const root = editor.getDomNode();
+        if (!root?.classList?.contains("monaco-editor")) return false;
+        monacoEditors.add(editor);
+        editorByRoot.set(root, editor);
+        if (!trackedEditors.has(editor)) {
+          trackedEditors.add(editor);
+          editor.onDidDispose?.(() => {
+            monacoEditors.delete(editor);
+            if (editorByRoot.get(root) === editor) editorByRoot.delete(root);
+          });
+        }
+        return true;
+      } catch (_) { return false; }
+    }
+
     function rememberMonaco(api) {
       try {
         for (const editor of api?.editor?.getEditors?.() || []) {
-          monacoEditors.add(editor);
+          rememberEditor(editor);
         }
         // Older Monaco versions expose creation events instead of getEditors().
         if (api?.editor?.onDidCreateEditor && !api.editor[DOC_MARK]) {
-          api.editor.onDidCreateEditor(editor => monacoEditors.add(editor));
+          api.editor.onDidCreateEditor(rememberEditor);
           Object.defineProperty(api.editor, DOC_MARK, { value: true });
         }
       } catch (_) {}
+    }
+
+    function findMonaco(root, win) {
+      const cached = editorByRoot.get(root);
+      try {
+        if (cached?.getDomNode() === root && cached.getModel()) return cached;
+      } catch (_) {}
+      editorByRoot.delete(root);
+      rememberMonaco(win.monaco || win.Monaco);
+      for (const editor of monacoEditors) {
+        try {
+          if (editor.getDomNode() === root && editor.getModel()) return editor;
+        } catch (_) { monacoEditors.delete(editor); }
+      }
+
+      // ESM Monaco builds do not publish window.monaco. React wrappers keep
+      // the real editor in a class field, forwarded ref, or useRef hook instead.
+      // Inspect only nearby component refs; never guess a model by its order,
+      // mutate React props, or write the editor's hidden textarea directly.
+      const seen = new WeakSet();
+      let budget = 600;
+      function inspect(value, depth = 0) {
+        if (!value || (typeof value !== "object" && typeof value !== "function") ||
+            seen.has(value) || depth > 5 || --budget < 0) return null;
+        seen.add(value);
+        if (rememberEditor(value)) {
+          try { if (value.getDomNode() === root && value.getModel()) return value; }
+          catch (_) {}
+          return null;
+        }
+        // Read data properties only, so discovery cannot trigger app getters.
+        let descriptors;
+        try { descriptors = Object.getOwnPropertyDescriptors(value); }
+        catch (_) { return null; }
+        for (const key of Object.keys(descriptors)) {
+          if (!/^(current|instance|memoizedState)$|editor|monaco|ref/i.test(key)) continue;
+          const descriptor = descriptors[key];
+          if (!("value" in descriptor)) continue;
+          const found = inspect(descriptor.value, depth + 1);
+          if (found) return found;
+        }
+        return null;
+      }
+      const fibers = new Set();
+      for (let node = root, level = 0; node && level < 16; node = node.parentElement, level++) {
+        for (const key of Object.keys(node)) {
+          if (!/^__react(?:Fiber\$|InternalInstance\$)/.test(key)) continue;
+          for (let fiber = node[key], count = 0;
+               fiber && !fibers.has(fiber) && count < 80;
+               fiber = fiber.return, count++) {
+            fibers.add(fiber);
+            for (const candidate of [fiber.stateNode, fiber.ref]) {
+              const found = inspect(candidate);
+              if (found) return found;
+            }
+            // Function component hooks form a linked list, not an object tree.
+            const hooks = new Set();
+            for (let hook = fiber.memoizedState, i = 0;
+                 hook && !hooks.has(hook) && i < 100; hook = hook.next, i++) {
+              hooks.add(hook);
+              const found = inspect(hook.memoizedState);
+              if (found) return found;
+            }
+          }
+        }
+      }
+      return null;
     }
 
     function routeFor(target, win) {
@@ -258,14 +349,8 @@
         }
       }
       if (root.classList.contains("monaco-editor")) {
-        rememberMonaco(win.monaco);
-        for (const editor of monacoEditors) {
-          try {
-            if (editor.getDomNode?.() === root) {
-              return { type: "monaco", el, editor, api: win.monaco };
-            }
-          } catch (_) { monacoEditors.delete(editor); }
-        }
+        const editor = findMonaco(root, win);
+        if (editor) return { type: "monaco", el, editor, api: win.monaco || win.Monaco };
       }
       // Never write directly into an unknown editor's hidden textarea: its
       // displayed value and document model can otherwise diverge.
@@ -374,10 +459,12 @@
       let doc;
       try { doc = win.document; } catch (_) { return; }
       if (!doc || docs.has(doc) || doc[DOC_MARK]) return;
+      // Reinstalling the userscript without refreshing would retain old
+      // window-capture handlers. Refresh after updating from 3.1.x.
       docs.add(doc);
       Object.defineProperty(doc, DOC_MARK, { value: true });
       documentCount++;
-      rememberMonaco(win.monaco);
+      rememberMonaco(win.monaco || win.Monaco);
 
       // Window capture runs before document/React/inline handlers. Keep default
       // editing enabled so the browser generates real input events and undo.
@@ -497,13 +584,15 @@
       const visit = win => {
         try {
           installWindow(win);
-          rememberMonaco(win.monaco);
+          rememberMonaco(win.monaco || win.Monaco);
           win.document.querySelectorAll("iframe,frame").forEach(frame => visit(frame.contentWindow));
         } catch (_) {}
       };
       visit(window);
     };
-    window.__pastePatchStatus = () => ({ version: VERSION, documentCount, lastRoute });
+    window.__pastePatchStatus = () => ({
+      version: VERSION, documentCount, lastRoute, monacoEditorCount: monacoEditors.size
+    });
     console.info("[pasteUnlock] 头歌复制/粘贴兼容修复已启用", VERSION);
   }
 
