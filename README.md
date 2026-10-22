@@ -1,7 +1,7 @@
 <a id="top"></a>
 <div align="center">
 
-# 头歌 / 学习通复制粘贴助手：3.1.0 候选版
+# 头歌 / 学习通复制粘贴助手：3.2.2 候选版
 
 **保留编辑选区与原文格式，改善有权编辑页面的粘贴体验。**
 
@@ -14,7 +14,7 @@
 
 基于 [ystemsrx/fuck-educoder-paste](https://github.com/ystemsrx/fuck-educoder-paste) 的 MIT fork。针对上游 [#1](https://github.com/ystemsrx/fuck-educoder-paste/issues/1)、[#2](https://github.com/ystemsrx/fuck-educoder-paste/issues/2)，改进编辑器选区、原文粘贴和错误目标防护。
 
-本次改动已于 2026-10-10 通过本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1) 合并到 `master`。这只确认本 fork 的合并状态；尚未确认这些改动已发布到 Greasy Fork。真实课程页面和脚本管理器兼容性仍需验收，不能据此宣称两个 issue 已在所有页面解决。
+早期改动已于 2026-10-10 通过本 fork 的 [PR #1](https://github.com/Maximora-byte/fuck-educoder-paste/pull/1) 合并。2026-10-22 整合上游 [3.2.1 / 974b7c6](https://github.com/ystemsrx/fuck-educoder-paste/commit/974b7c61f724965a70952d733ff79eb6d25b86a8) 的头歌适配，保留本 fork 的学习通保护和 Monaco 异常回退。上游已关闭 issue #1、#2；这不替代真实课程页面及脚本管理器验收，也不表示 fork 已发布到 Greasy Fork。
 
 <a id="quick-start"></a>
 ## 使用候选版
@@ -23,7 +23,7 @@
 2. 打开本 fork 默认分支 `master` 的 [fuck-educoder-paste.user.js](https://github.com/Maximora-byte/fuck-educoder-paste/blob/master/fuck-educoder-paste.user.js)，复制完整内容并替换旧脚本；不要同时启用多个版本。
 3. 只在你有权编辑的练习页面刷新并验收。本 fork 的合并不等于原作者 Greasy Fork 发布版已同步；安装前请核对所用脚本来源和版本。
 
-脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`。本次没有新增域名、运行时依赖、网络请求或权限，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。原作者的复制、全选、空白剪贴板写入保护等基础逻辑继续保留。
+脚本仍使用原来的 educoder.net、chaoxing.com、xueyinonline.com、chaoxingerya.com 域名范围，`@grant none`；与上游一致增加 `@sandbox raw`。没有新增域名、运行时依赖、网络请求或授权项，没有增加剪贴板持久化、剪贴板轮询、答题或试卷提取功能。更新后请刷新页面，避免旧捕获监听器继续生效。
 
 <a id="changes"></a>
 ## 本次升级
@@ -31,7 +31,10 @@
 <details>
 <summary>展开编辑器适配、选区与原生回退说明</summary>
 
-- **Monaco**：保留 3.0.1 的公开 `executeEdits` + `Selection` 路径、撤销边界和原始多行缩进；在事件发生时发现当前编辑器，避免依赖旧实例。查找框、多光标、只读、未暴露 API 或无事件文本时交回原生流程。
+- **头歌适配同步**：快捷键在 window 捕获阶段处理，支持同源 iframe 及动态挂载；通过全局 API 或附近 React 类组件、ref、hook 发现 Monaco 实例。按实际 DOM 身份匹配并清理已销毁实例，发现过程不执行应用 getter。
+- **Monaco**：保留公开 `executeEdits` + `Selection` 路径、撤销边界和原始多行缩进；未暴露全局 API 时使用当前选区实例的构造器。查找框、多光标、只读、实例不确定或无事件文本时交回原生流程。
+- **头歌原生输入**：普通 textarea 仅在空选区前调整待替换的空白范围，由浏览器完成粘贴及撤销；事件缺少文本时不启动延迟读取，因此不会在切换焦点后写回旧输入框。正常 Ant Design 消息和通知继续显示。
+- **其他头歌编辑器**：沿用上游 CodeMirror 5、ACE、CodeMirror 6 的发现及批量编辑路径，并支持编辑器复制、剪切、全选；真实平台版本仍需验收。
 - **CodeMirror 5 风格 API**：使用 `replaceSelection` / `replaceSelections`；只有 `replaceRange` 时使用完整选区起止位置，并在可用时把光标置于插入末尾。以 `paste` 来源保留编辑器的历史机制，同文本替换也能识别成功。
 - **尊重只读及验证器**：删除临时关闭 CodeMirror `readOnly`、清空私有 `beforeChange` 回调和强制重试的实现。编辑器拒绝操作时保留原生流程；原生编辑器自己可能再次处理该事件。
 - **UEditor**：仅在已有实例的文档、body 或 iframe 身份匹配时使用实例，多个行内宿主还需匹配实际 body。发现实例不再调用会创建编辑器的 `UE.getEditor`。将已验证的实时选区交给 UEditor，再用 `execCommand('insertHTML')` 进入其撤销/内容同步机制；禁用命令不走强制 DOM 回退。
@@ -53,11 +56,11 @@ node --check fuck-educoder-paste.user.js
 node --test tests/*.test.cjs
 ```
 
-- 当前 121 个隔离回归测试通过。原有 54 项防护仍覆盖；其中旧 Ctrl+V 隐藏输入框集成用例改为验证真实焦点保留和普通粘贴事件。此前新增 40 项适配器及事件回退测试，本次再增加 27 项 Monaco 异常回退测试。
-- Monaco 异常修复：缺少必要 API 或写入前抛错时保留原生事件；写入后抛错时通过原模型版本/内容变化避免重复粘贴，同文本替换使用版本变化判断。异常时仍尝试关闭撤销边界。扩展后的 41 项 Monaco 测试在修复前为 21 通过、20 失败，修复后全部通过。
+- 当前 126 个隔离回归测试通过。学习通既有回归测试全部保留；头歌测试更新为原生 textarea 范围处理，并增加 React 实例发现、应用 getter 防护、无延迟粘贴、快捷键阶段及复制/剪切测试。
+- Monaco 缺少必要 API 或写入前抛错时保留原生事件；写入后抛错时通过原模型版本/内容变化避免重复粘贴，同文本替换使用版本变化判断。异常时仍尝试关闭撤销边界。
 - 测试提取实际源码函数，使用编辑器 API / DOM 模拟。包括只读、验证器取消、同文本替换、异常后重复粘贴、错误实例/宿主、动态挂载、旧焦点/选区及异步光标变化。
 - 可选 `node tests/browser-smoke.cjs` 使用预装 Playwright 和 Chromium（可用 `CHROMIUM_PATH` 指定路径）。所有页面请求本地填充或阻断；不访问课程站点，UEditor / CodeMirror 仍是 API 模拟。无需为基础测试安装它们。
-- **浏览器夹具未运行通过**：本次环境在 Chromium 启动时拒绝创建进程单例 socket，六个浏览器断言均未执行；仅脚本语法检查通过。真实浏览器撤销栈、扩展注入时序和真实编辑器版本兼容性尚未验证。
+- 2026-10-22 使用本机 Chrome 运行学习通 6 项浏览器夹具检查，全部通过；`node tests/educoder-browser-smoke.cjs` 的头歌 5 项检查也通过，覆盖原生待替换范围、无延迟粘贴、通知显示、iframe 安装及真实 Ctrl+A 捕获。页面请求均本地填充或阻断。真实课程、脚本管理器扩展注入及真实编辑器版本尚未验收。
 - 没有配置或运行 GitHub Actions。
 
 <a id="acceptance"></a>
@@ -72,7 +75,7 @@ node --test tests/*.test.cjs
 5. 切换题目或动态打开编辑器后仍能粘贴；只读编辑器、不可编辑区域保持不变。
 6. 浏览器/平台拒绝剪贴板或编辑器 API 不可用时，没有旧光标写入、抢焦点或后台剪贴板读取。
 
-平台限制在原生回退时仍可能生效。ACE、CodeMirror 6、未暴露 Monaco API 的构建和不同 UEditor 版本没有专门适配或完整验证。反馈问题时请附浏览器、脚本管理器、编辑器类型、复现步骤和脱敏截图，不要提交课程答案或私人数据。
+平台限制在原生回退时仍可能生效。ACE、CodeMirror 6、React 内部 Monaco 和不同 UEditor 版本尚未完成真实平台兼容性验收。反馈问题时请附浏览器、脚本管理器、编辑器类型、复现步骤和脱敏截图，不要提交课程答案或私人数据。
 
 <a id="license"></a>
 ## 设计参考与许可

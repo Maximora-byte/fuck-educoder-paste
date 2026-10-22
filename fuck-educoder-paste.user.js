@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ✨2026最新可用 - 完美解决【头歌/学习通】禁复制/粘贴问题
 // @namespace    https://github.com/ystemsrx/fuck-educoder-paste
-// @version      3.1.0
+// @version      3.2.2
 // @description  1）阻止网页脚本拦截复制/粘贴/全选等快捷键；2）禁止网页往剪贴板写入“全空白”内容；3）在代码编辑器中粘贴前，如果光标前一段是纯空格/Tab，则先清掉这些缩进，再原样粘贴内容。
 // @author       ystemsrx
 // @match        https://www.educoder.net/*
@@ -14,6 +14,7 @@
 // @match        *://*.chaoxingerya.com/*
 // @match        *://chaoxingerya.com/*
 // @run-at       document-start
+// @sandbox      raw
 // @license      MIT
 // @grant        none
 // ==/UserScript==
@@ -213,109 +214,177 @@
   // 头歌平台：复制 / 粘贴 / 全选解锁 + 编辑器粘贴缩进处理
   // ============================================================
   function installEducoderUnlock() {
-    function enableSelection() {
-      try {
-        const id = "__pasteUnlock_user_select__";
+    const VERSION = "3.2.2";
+    const DOC_MARK = "__educoderPasteUnlock322__";
+    const docs = new WeakSet();
+    const frames = new WeakSet();
+    const monacoEditors = new Set();
+    const trackedEditors = new WeakSet();
+    const editorByRoot = new WeakMap();
+    let documentCount = 0;
+    let lastRoute = "native";
 
-        if (!document.getElementById(id)) {
-          const style = document.createElement("style");
-          style.id = id;
-          style.textContent = `
-            * {
-              -webkit-user-select: text !important;
-              -moz-user-select: text !important;
-              -ms-user-select: text !important;
-              user-select: text !important;
-            }
-
-            body {
-              -webkit-user-select: text !important;
-              -moz-user-select: text !important;
-              -ms-user-select: text !important;
-              user-select: text !important;
-            }
-
-            .ant-message,
-            .ant-message-notice,
-            .ant-notification {
-              display: none !important;
-            }
-          `;
-
-          document.head && document.head.appendChild(style);
-        }
-      } catch (err) {
-        console.error("[pasteUnlock] enableSelection error:", err);
-      }
+    function editorRoot(el) {
+      return el?.closest?.(".CodeMirror,.monaco-editor,.ace_editor,.cm-editor");
     }
 
-    function hasCodeyClass(node) {
-      while (node && node !== document.documentElement) {
-        let cls = "";
+    function rememberEditor(editor) {
+      if (!editor || typeof editor.getDomNode !== "function" ||
+          typeof editor.getModel !== "function" ||
+          typeof editor.executeEdits !== "function" ||
+          typeof editor.getSelections !== "function") return false;
+      try {
+        const root = editor.getDomNode();
+        if (!root?.classList?.contains("monaco-editor")) return false;
+        monacoEditors.add(editor);
+        editorByRoot.set(root, editor);
+        if (!trackedEditors.has(editor)) {
+          trackedEditors.add(editor);
+          editor.onDidDispose?.(() => {
+            monacoEditors.delete(editor);
+            if (editorByRoot.get(root) === editor) editorByRoot.delete(root);
+          });
+        }
+        return true;
+      } catch (_) { return false; }
+    }
 
+    function rememberMonaco(api) {
+      try {
+        for (const editor of api?.editor?.getEditors?.() || []) {
+          rememberEditor(editor);
+        }
+        // Older Monaco versions expose creation events instead of getEditors().
+        if (api?.editor?.onDidCreateEditor && !api.editor[DOC_MARK]) {
+          api.editor.onDidCreateEditor(rememberEditor);
+          Object.defineProperty(api.editor, DOC_MARK, { value: true });
+        }
+      } catch (_) {}
+    }
+
+    function findMonaco(root, win) {
+      const cached = editorByRoot.get(root);
+      try {
+        if (cached?.getDomNode() === root && cached.getModel()) return cached;
+      } catch (_) {}
+      editorByRoot.delete(root);
+      rememberMonaco(win.monaco || win.Monaco);
+      for (const editor of monacoEditors) {
         try {
-          if (typeof node.className === "string") cls += node.className + " ";
-          if (typeof node.id === "string") cls += node.id;
-        } catch (_) {}
-
-        cls = cls.toLowerCase();
-
-        if (
-          cls.includes("code") ||
-          cls.includes("editor") ||
-          cls.includes("monaco") ||
-          cls.includes("ace") ||
-          cls.includes("codemirror") ||
-          cls.includes("cm-editor")
-        ) {
-          return true;
-        }
-
-        node = node.parentElement;
+          if (editor.getDomNode() === root && editor.getModel()) return editor;
+        } catch (_) { monacoEditors.delete(editor); }
       }
 
-      return false;
-    }
-
-    function isCodeEditorLike(target) {
-      const el = toElement(target);
-      if (!el) return false;
-
-      const tag = lower(el.tagName);
-
-      if (tag === "textarea") return true;
-
-      if (tag === "input") {
-        const type = lower(el.type || "");
-        if (
-          ["text", "search", "url", "email", "number", "password"].includes(type)
-        ) {
-          return hasCodeyClass(el);
+      // ESM Monaco builds do not publish window.monaco. React wrappers keep
+      // the real editor in a class field, forwarded ref, or useRef hook instead.
+      // Inspect only nearby component refs; never guess a model by its order,
+      // mutate React props, or write the editor's hidden textarea directly.
+      const seen = new WeakSet();
+      let budget = 600;
+      function inspect(value, depth = 0) {
+        if (!value || (typeof value !== "object" && typeof value !== "function") ||
+            seen.has(value) || depth > 5 || --budget < 0) return null;
+        seen.add(value);
+        if (rememberEditor(value)) {
+          try { if (value.getDomNode() === root && value.getModel()) return value; }
+          catch (_) {}
+          return null;
         }
-      }
-
-      if (el.isContentEditable) return true;
-
-      return hasCodeyClass(el);
-    }
-
-    // Monaco's hidden textarea is not the document model. execCommand there
-    // can take the typing path and auto-indent every line of a multiline paste.
-    function findMonacoEditor(target) {
-      const el = toElement(target);
-      if (!el?.closest?.(".monaco-editor")) return null;
-      const win = getWin(getDoc(el));
-      try {
-        if (typeof win.monaco?.Selection !== "function") return null;
-        return win.monaco?.editor?.getEditors?.().find(editor =>
-          editor.getDomNode()?.contains(el) && editor.hasTextFocus()
-        ) || null;
-      } catch (_) {
+        // Read data properties only, so discovery cannot trigger app getters.
+        let descriptors;
+        try { descriptors = Object.getOwnPropertyDescriptors(value); }
+        catch (_) { return null; }
+        for (const key of Object.keys(descriptors)) {
+          if (!/^(current|instance|memoizedState)$|editor|monaco|ref/i.test(key)) continue;
+          const descriptor = descriptors[key];
+          if (!("value" in descriptor)) continue;
+          const found = inspect(descriptor.value, depth + 1);
+          if (found) return found;
+        }
         return null;
       }
+      const fibers = new Set();
+      for (let node = root, level = 0; node && level < 16; node = node.parentElement, level++) {
+        for (const key of Object.keys(node)) {
+          if (!/^__react(?:Fiber\$|InternalInstance\$)/.test(key)) continue;
+          for (let fiber = node[key], count = 0;
+               fiber && !fibers.has(fiber) && count < 80;
+               fiber = fiber.return, count++) {
+            fibers.add(fiber);
+            for (const candidate of [fiber.stateNode, fiber.ref]) {
+              const found = inspect(candidate);
+              if (found) return found;
+            }
+            // Function component hooks form a linked list, not an object tree.
+            const hooks = new Set();
+            for (let hook = fiber.memoizedState, i = 0;
+                 hook && !hooks.has(hook) && i < 100; hook = hook.next, i++) {
+              hooks.add(hook);
+              const found = inspect(hook.memoizedState);
+              if (found) return found;
+            }
+          }
+        }
+      }
+      return null;
     }
 
-    function insertIntoMonaco(editor, text, Selection) {
+    function routeFor(target, win) {
+      const el = toElement(target);
+      const root = editorRoot(el);
+      if (!root) return { type: "native", el };
+      if (root.classList.contains("CodeMirror") && root.CodeMirror) {
+        return { type: "codemirror", el, editor: root.CodeMirror };
+      }
+      if (root.classList.contains("ace_editor")) {
+        const editor = root.env?.editor;
+        if (editor) return { type: "ace", el, editor };
+      }
+      if (root.classList.contains("cm-editor")) {
+        // CodeMirror 6 publishes its view on the content view's DOM node.
+        const content = root.querySelector(".cm-content");
+        const view = content?.cmView?.view || root.cmView?.view;
+        if (view?.dispatch && view?.state?.replaceSelection) {
+          return { type: "codemirror6", el, editor: view };
+        }
+      }
+      if (root.classList.contains("monaco-editor")) {
+        const editor = findMonaco(root, win);
+        if (editor?.hasTextFocus?.()) return { type: "monaco", el, editor, api: win.monaco || win.Monaco };
+      }
+      // Never write directly into an unknown editor's hidden textarea: its
+      // displayed value and document model can otherwise diverge.
+      return { type: "unresolved", el };
+    }
+
+    function writable(route) {
+      const { el, editor, type } = route;
+      if (el?.disabled || el?.readOnly) return false;
+      if (type === "codemirror") return !editor.getOption("readOnly");
+      if (type === "ace") return !editor.getReadOnly();
+      if (type === "codemirror6") return !editor.state.readOnly;
+      if (type === "monaco") {
+        const option = route.api?.editor?.EditorOption?.readOnly;
+        if (option !== undefined && editor.getOption?.(option)) return false;
+        if (editor.getRawOptions?.().readOnly) return false;
+      }
+      return true;
+    }
+
+    function prepareNativePaste(el) {
+      if (lower(el?.tagName) !== "textarea" || el.disabled || el.readOnly ||
+          typeof el.selectionStart !== "number" || el.selectionStart !== el.selectionEnd) return;
+      const start = el.selectionStart;
+      const lineStart = el.value.lastIndexOf("\n", start - 1) + 1;
+      const prefix = el.value.slice(lineStart, start);
+      if (prefix && /^[\t ]+$/.test(prefix)) {
+        // Let the browser replace the indentation together with the selection.
+        // Keeping the value untouched preserves native input events and undo.
+        el.setSelectionRange(lineStart, el.selectionEnd, el.selectionDirection);
+      }
+    }
+
+    function insertIntoMonaco(editor, text, Selection, cleanIndent = false) {
       // An incomplete exposed API must leave the original paste untouched.
       if (typeof Selection !== "function" ||
           ["getModel", "getSelections", "getRawOptions", "pushUndoStop", "executeEdits"]
@@ -342,7 +411,7 @@
       const prefix = model.getLineContent(range.startLineNumber)
         .slice(0, range.startColumn - 1);
       // Never collapse an existing selection or erase selected code first.
-      if (empty && /^[\t ]+$/.test(prefix)) range.startColumn = 1;
+      if (cleanIndent && empty && /^[\t ]+$/.test(prefix)) range.startColumn = 1;
 
       // executeEdits requires real Selection instances for its end state.
       // Compute the single replacement's endpoint without internal edit IDs;
@@ -381,242 +450,204 @@
       return inserted || didMutate();
     }
 
-    function insertTextAtCursor(target, text) {
-      if (!text) return;
-
-      const el = toElement(target);
-      if (!el || el.readOnly || el.disabled) return;
-
-      const doc = el.ownerDocument || document;
-      const win = doc.defaultView || window;
-
-      if (el.isContentEditable) {
-        const sel = win.getSelection();
-
-        if (!sel || !sel.rangeCount || !el.contains(sel.anchorNode)) {
-          const range = doc.createRange();
-          range.selectNodeContents(el);
-          range.collapse(false);
-
-          const sel2 = win.getSelection();
-          sel2.removeAllRanges();
-          sel2.addRange(range);
-        }
+    function insertEditor(route, text, { cleanIndent = false } = {}) {
+      if (!writable(route)) return false;
+      const { editor, type } = route;
+      if (type === "codemirror") {
+        editor.operation(() => {
+          const ranges = editor.listSelections();
+          // Expanding multiple ranges can merge cursors or create overlapping
+          // edits. Preserve their original boundaries, including for cuts.
+          if (cleanIndent && ranges.length === 1) {
+            const { anchor: a, head: h } = ranges[0];
+            const start = a.line < h.line || (a.line === h.line && a.ch <= h.ch) ? a : h;
+            const end = start === a ? h : a;
+            const prefix = editor.getLine(start.line).slice(0, start.ch);
+            if (prefix && /^[\t ]+$/.test(prefix)) {
+              editor.setSelection({ line: start.line, ch: 0 }, end);
+            }
+          }
+          editor.replaceSelections(ranges.map(() => text), "end", "+input");
+        });
+      } else if (type === "monaco") {
+        // Bundled Monaco keeps real Selection instances on the editor even
+        // when React has not exposed a global Monaco namespace.
+        const Selection = route.api ? route.api.Selection : editor.getSelections?.()?.[0]?.constructor;
+        if (!insertIntoMonaco(editor, text, Selection, cleanIndent)) return false;
+      } else if (type === "ace") {
+        editor.insert(text);
+      } else if (type === "codemirror6") {
+        editor.dispatch(editor.state.replaceSelection(text), {
+          scrollIntoView: true,
+          userEvent: "input.paste"
+        });
       } else {
-        if (doc.activeElement !== el && typeof el.focus === "function") {
-          el.focus();
-        }
+        return false;
       }
-
-      let handledByCommand = false;
-
-      try {
-        if (
-          !doc.queryCommandSupported ||
-          doc.queryCommandSupported("insertText")
-        ) {
-          handledByCommand = doc.execCommand("insertText", false, text);
-        }
-      } catch (_) {
-        handledByCommand = false;
-      }
-
-      if (handledByCommand) return;
-
-      if (el.isContentEditable) {
-        const sel = win.getSelection();
-        if (!sel) return;
-
-        if (!sel.rangeCount) {
-          const range = doc.createRange();
-          range.selectNodeContents(el);
-          range.collapse(false);
-          sel.addRange(range);
-        }
-
-        const range = sel.getRangeAt(0);
-        range.deleteContents();
-        range.insertNode(doc.createTextNode(text));
-        range.collapse(false);
-
-        sel.removeAllRanges();
-        sel.addRange(range);
-        dispatchBasicEvents(el, win);
-        return;
-      }
-
-      if (
-        typeof el.setRangeText === "function" &&
-        typeof el.selectionStart === "number"
-      ) {
-        const start = el.selectionStart;
-        const end = el.selectionEnd;
-        el.setRangeText(text, start, end, "end");
-        dispatchBasicEvents(el, win);
-        return;
-      }
-
-      if (typeof el.value === "string") {
-        el.value += text;
-        dispatchBasicEvents(el, win);
-      }
+      lastRoute = type;
+      return true;
     }
 
-    function cleanIndentBeforeCursorIfPlainWS(target) {
-      try {
-        const el = toElement(target);
+    function selectedText(route) {
+      const { type, editor } = route;
+      if (type === "codemirror") return editor.getSelections().join("\n");
+      if (type === "ace") return editor.getSelectedText();
+      if (type === "codemirror6") {
+        return editor.state.selection.ranges.map(r => editor.state.sliceDoc(r.from, r.to)).join("\n");
+      }
+      if (type === "monaco") {
+        const model = editor.getModel();
+        return model ? editor.getSelections().map(r => model.getValueInRange(r)).join("\n") : "";
+      }
+      return "";
+    }
 
-        if (
-          !(
-            el instanceof HTMLTextAreaElement ||
-            el instanceof HTMLInputElement
-          )
-        ) {
+    function stopPageHandlers(event) {
+      event.stopImmediatePropagation();
+    }
+
+    function installWindow(win) {
+      let doc;
+      try { doc = win.document; } catch (_) { return; }
+      if (!doc || docs.has(doc) || doc[DOC_MARK]) return;
+      // Reinstalling the userscript without refreshing would retain old
+      // window-capture handlers. Refresh after updating from 3.1.x.
+      docs.add(doc);
+      Object.defineProperty(doc, DOC_MARK, { value: true });
+      documentCount++;
+      rememberMonaco(win.monaco || win.Monaco);
+
+      // Window capture runs before document/React/inline handlers. Keep default
+      // editing enabled so the browser generates real input events and undo.
+      for (const type of ["keydown", "keyup"]) {
+        win.addEventListener(type, event => {
+          if (event.isComposing || event.altKey) return;
+          const key = lower(event.key);
+          const shortcut = ((event.ctrlKey || event.metaKey) && ["a", "c", "v", "x"].includes(key)) ||
+            (event.shiftKey && key === "insert");
+          const route = shortcut ? routeFor(event.target, win) : null;
+          if (route && route.type !== "unresolved") {
+            if (type === "keydown" && key === "a" && route.type !== "native") {
+              const editor = route.editor;
+              if (route.type === "codemirror") editor.execCommand("selectAll");
+              if (route.type === "ace") editor.selectAll();
+              if (route.type === "monaco" && editor.getModel()) {
+                editor.setSelection(editor.getModel().getFullModelRange());
+              }
+              if (route.type === "codemirror6") {
+                editor.dispatch({ selection: { anchor: 0, head: editor.state.doc.length } });
+              }
+              event.preventDefault();
+            }
+            stopPageHandlers(event);
+          }
+        }, true);
+      }
+
+      win.addEventListener("paste", event => {
+        const route = routeFor(event.target, win);
+        if (route.type === "unresolved") return;
+        if (route.type === "native") {
+          if (getClipboardTextFromEvent(event)) prepareNativePaste(route.el);
+          stopPageHandlers(event);
+          lastRoute = "native";
           return;
         }
-
-        if (el.readOnly || el.disabled) return;
-        if (typeof el.value !== "string") return;
-        if (typeof el.selectionStart !== "number") return;
-        if (el.selectionStart !== el.selectionEnd) return;
-
-        const val = el.value;
-        const start = el.selectionStart;
-
-        let lineStart = val.lastIndexOf("\n", start - 1);
-        if (lineStart === -1) {
-          lineStart = 0;
-        } else {
-          lineStart += 1;
+        const text = getClipboardTextFromEvent(event);
+        if (!text) return;
+        try {
+          if (!writable(route)) return;
+          if (insertEditor(route, text, { cleanIndent: true })) {
+            event.preventDefault();
+            stopPageHandlers(event);
+          }
+        } catch (err) {
+          console.warn("[pasteUnlock] editor insertion failed; preserving native paste", err);
         }
+      }, true);
 
-        const pre = val.slice(lineStart, start);
-
-        if (pre && /^[\t ]+$/.test(pre)) {
-          const before = val.slice(0, lineStart);
-          const after = val.slice(start);
-
-          el.value = before + after;
-
-          const newPos = start - pre.length;
-          el.selectionStart = newPos;
-          el.selectionEnd = newPos;
-        }
-      } catch (err) {
-        console.warn(
-          "[pasteUnlock] cleanIndentBeforeCursorIfPlainWS failed:",
-          err
-        );
-      }
-    }
-
-    document.addEventListener(
-      "keydown",
-      e => {
-        const key = lower(e.key || "");
-        const code = e.keyCode || e.which || 0;
-        const ctrlLike = e.ctrlKey || e.metaKey;
-
-        if (!ctrlLike) return;
-
-        const isComboKey =
-          ["c", "v", "a"].includes(key) || [67, 86, 65].includes(code);
-
-        if (!isComboKey) return;
-
-        e.stopPropagation();
-        e.stopImmediatePropagation();
-      },
-      false
-    );
-
-    window.addEventListener(
-      "copy",
-      e => {
-        e.stopImmediatePropagation();
-      },
-      true
-    );
-
-    window.addEventListener(
-      "paste",
-      e => {
-        const target = e.target;
-        const el = toElement(target);
-        if (el?.readOnly || el?.disabled) return;
-        const monacoRoot = el?.closest?.(".monaco-editor");
-        if (monacoRoot) {
-          // A bundled Monaco may not expose its API. Its find/replace widgets
-          // also live inside .monaco-editor, but are not model input fields.
-          const editor = findMonacoEditor(target);
-          if (!editor) return;
-          let raw = "";
-          try {
-            raw = getClipboardTextFromEvent(e);
-          } catch (_) {}
-          // Keep the native path for unavailable/non-text clipboard data.
-          // Never await a clipboard read and paste into a later selection.
-          if (!raw) return;
-          try {
-            const Selection = getWin(getDoc(el)).monaco.Selection;
-            if (!insertIntoMonaco(editor, raw, Selection)) return;
-          } catch (err) {
-            console.warn("[pasteUnlock] Monaco paste failed:", err);
+      for (const type of ["copy", "cut"]) {
+        win.addEventListener(type, event => {
+          const route = routeFor(event.target, win);
+          if (route.type === "unresolved") return;
+          if (route.type === "native") {
+            stopPageHandlers(event);
             return;
           }
-          // Cancel only a successful edit or a verified model mutation.
-          e.stopImmediatePropagation();
-          e.preventDefault();
-          return;
-        }
-        e.stopImmediatePropagation();
-
-        if (!target) return;
-
-        if (!isCodeEditorLike(target)) {
-          return;
-        }
-
-        e.preventDefault();
-
-        (async () => {
-          let raw = "";
-
           try {
-            raw = getClipboardTextFromEvent(e);
+            const text = selectedText(route);
+            if (!text || !event.clipboardData) return;
+            if (type === "cut" && !writable(route)) return;
+            event.clipboardData.setData("text/plain", text);
+            if (type === "cut" && !insertEditor(route, "")) return;
+            event.preventDefault();
+            stopPageHandlers(event);
+          } catch (err) { console.warn("[pasteUnlock] copy/cut failed", err); }
+        }, true);
+      }
 
-            if (!raw) {
-              raw = await readClipboardText(getWin(getDoc(e?.target)));
-            }
-          } catch (err) {
-            console.warn("[pasteUnlock] read clipboard for paste failed:", err);
+      win.addEventListener("beforeinput", event => {
+        if (lower(event.inputType) === "insertfrompaste" &&
+            routeFor(event.target, win).type === "native") stopPageHandlers(event);
+      }, true);
+      for (const type of ["contextmenu", "selectstart"]) {
+        win.addEventListener(type, event => {
+          if (!editorRoot(toElement(event.target))) stopPageHandlers(event);
+        }, true);
+      }
+
+      function patchFrame(frame) {
+        if (!frames.has(frame)) {
+          frames.add(frame);
+          frame.addEventListener("load", () => {
+            try { installWindow(frame.contentWindow); } catch (_) {}
+          });
+        }
+        try { installWindow(frame.contentWindow); } catch (_) {}
+      }
+
+      function scan(root) {
+        if (root?.matches?.("iframe,frame")) patchFrame(root);
+        root?.querySelectorAll?.("iframe,frame").forEach(patchFrame);
+      }
+
+      function ready() {
+        if (!doc.getElementById("__pasteUnlock_user_select__")) {
+          const style = doc.createElement("style");
+          style.id = "__pasteUnlock_user_select__";
+          style.textContent = "html body,html body *{-webkit-user-select:text!important;user-select:text!important}";
+          (doc.head || doc.documentElement).appendChild(style);
+        }
+        scan(doc);
+        const observer = new win.MutationObserver(records => {
+          for (const record of records) {
+            for (const node of record.addedNodes) scan(node);
           }
-
-          if (!raw) return;
-
-          cleanIndentBeforeCursorIfPlainWS(target);
-          insertTextAtCursor(target, raw);
-        })();
-      },
-      true
-    );
-
-    function domReady() {
-      enableSelection();
-      console.log(
-        "[pasteUnlock] 头歌复制/粘贴解锁 + 剪贴板空白写入防护 + 行首缩进清理已启用"
-      );
+        });
+        observer.observe(doc.documentElement, { childList: true, subtree: true });
+      }
+      if (doc.documentElement) ready();
+      else doc.addEventListener("DOMContentLoaded", ready, { once: true });
     }
 
-    if (
-      document.readyState === "complete" ||
-      document.readyState === "interactive"
-    ) {
-      domReady();
-    } else {
-      window.addEventListener("DOMContentLoaded", domReady, { once: true });
-    }
+    installWindow(window);
+    window.__pastePatchInstall = () => {
+      // Useful after a SPA route change; existing documents are not patched twice.
+      const visit = win => {
+        try {
+          installWindow(win);
+          rememberMonaco(win.monaco || win.Monaco);
+          win.document.querySelectorAll("iframe,frame").forEach(frame => visit(frame.contentWindow));
+        } catch (_) {}
+      };
+      visit(window);
+    };
+    window.__pastePatchStatus = () => ({
+      version: VERSION, documentCount, lastRoute, monacoEditorCount: monacoEditors.size
+    });
+    console.info("[pasteUnlock] 头歌复制/粘贴兼容修复已启用", VERSION);
   }
+
 
   // ============================================================
   // 超星 / 学习通 / 学银 / 尔雅：CodeMirror / UEditor / 富文本粘贴增强

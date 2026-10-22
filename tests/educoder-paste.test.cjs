@@ -33,9 +33,9 @@ function position(value, index) {
   return { lineNumber: lines.length, column: lines.at(-1).length + 1 };
 }
 function setup({ monaco = true, readonly = false, disabled = false, selected = false,
-  textFocus = true, value = '    old', selections } = {}) {
+  textFocus = true, value = '    old', selections, beforeInstall = () => {} } = {}) {
   const handlers = {};
-  const calls = { edits: [], undo: 0, commands: 0, reads: 0, order: [], warnings: [] };
+  const calls = { edits: [], undo: 0, commands: 0, reads: 0, order: [], warnings: [], registrations: [] };
   const doc = { nodeType: 9, readyState: 'loading', addEventListener() {},
     queryCommandSupported: () => true, execCommand(_command, _ui, text) {
       calls.commands++;
@@ -44,19 +44,22 @@ function setup({ monaco = true, readonly = false, disabled = false, selected = f
     } };
   class Input {}
   class Textarea extends Input {
+    setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
     setRangeText(text, start, end) {
       this.value = this.value.slice(0, start) + text + this.value.slice(end);
       this.selectionStart = this.selectionEnd = start + text.length;
     }
   }
-  const root = { ownerDocument: doc, contains: el => el === target };
+  const root = { ownerDocument: doc, contains: el => el === target,
+    classList: { contains: name => name === 'monaco-editor' } };
   const target = Object.assign(new Textarea(), { nodeType: 1, tagName: 'TEXTAREA', ownerDocument: doc,
     value, selectionStart: 4, selectionEnd: selected ? 7 : 4,
     readOnly: !monaco && readonly, disabled,
     closest: () => monaco ? root : null, focus() { doc.activeElement = this; } });
   doc.activeElement = target;
   let current = selections || [new Selection(1, 5, 1, selected ? 8 : 5)];
-  const model = { value, version: 1, getValue() { return this.value; }, getVersionId() { return this.version; }, getLineContent(lineNumber) { return this.value.split('\n')[lineNumber - 1]; } };
+  const model = { value, version: 1, getValue() { return this.value; }, getVersionId() { return this.version; }, getLineContent(lineNumber) { return this.value.split('\n')[lineNumber - 1]; },
+    getValueInRange(r) { return this.value.slice(offset(this.value, r.startLineNumber, r.startColumn), offset(this.value, r.endLineNumber, r.endColumn)); } };
   const history = [];
   const editor = { getDomNode: () => root, hasTextFocus: () => textFocus,
     getModel: () => model, getSelections: () => current, getRawOptions: () => ({ readOnly: readonly }),
@@ -99,11 +102,14 @@ function setup({ monaco = true, readonly = false, disabled = false, selected = f
     },
     undo() { const previous = history.pop(); model.value = previous.value; current = previous.selections; }
   };
-  const win = { addEventListener(type, fn) { handlers[type] = fn; },
+  const win = { document: doc, addEventListener(type, fn, options) {
+      handlers[type] = fn; calls.registrations.push({ type, options });
+    },
     monaco: { Selection, editor: { getEditors: () => [editor] } } };
+  beforeInstall(win);
   doc.defaultView = win;
   const context = { window: win, document: doc,
-    console: { log() {}, warn(...args) { calls.warnings.push(args); }, error(...args) { calls.warnings.push(args); } },
+    console: { log() {}, info() {}, warn(...args) { calls.warnings.push(args); }, error(...args) { calls.warnings.push(args); } },
     HTMLInputElement: Input, HTMLTextAreaElement: Textarea,
     lower: x => String(x ?? '').toLowerCase(), toElement: x => x, getDoc: x => x?.ownerDocument,
     getWin: x => x?.defaultView || win, getClipboardTextFromEvent: e => e.clipboardData.getData(),
@@ -119,7 +125,7 @@ function setup({ monaco = true, readonly = false, disabled = false, selected = f
     handlers.paste(event);
     return event;
   }
-  return { calls, editor, model, win, target, paste };
+  return { calls, editor, model, win, target, root, handlers, paste };
 }
 
 test('Monaco multiline paste preserves indentation in the model and is one undo operation', () => {
@@ -184,9 +190,9 @@ test('Monaco read-only model is not written or routed through its textarea', () 
   assert.equal(h.calls.edits.length, 0); assert.equal(h.calls.commands, 0);
 });
 test('unexposed or incomplete Monaco API preserves the native paste event', () => {
-  for (const hide of [h => { delete h.win.monaco; }, h => { delete h.win.monaco.Selection; },
-    h => { delete h.win.monaco.editor.getEditors; }]) {
-    const h = setup(); hide(h); const e = h.paste('text');
+  for (const hide of [win => { delete win.monaco; }, win => { delete win.monaco.Selection; },
+    win => { delete win.monaco.editor.getEditors; }]) {
+    const h = setup({ beforeInstall: hide }); const e = h.paste('text');
     assert.equal(e.stopped, false); assert.equal(e.prevented, false);
     assert.equal(h.calls.commands, 0); assert.equal(h.model.value, '    old');
   }
@@ -206,12 +212,16 @@ test('a detached Monaco model keeps the native path', () => {
   assert.equal(e.prevented, false); assert.equal(h.calls.edits.length, 0);
 });
 test('plain textarea selection survives indentation cleanup', () => {
-  const h = setup({ monaco: false, selected: true }); h.paste('new');
-  assert.equal(h.target.value, '    new'); assert.equal(h.calls.commands, 1);
+  const h = setup({ monaco: false, selected: true }); const e = h.paste('new');
+  assert.equal(h.target.value, '    old'); assert.equal(h.calls.commands, 0);
+  assert.equal(h.target.selectionStart, 4); assert.equal(h.target.selectionEnd, 7);
+  assert.equal(e.prevented, false);
 });
-test('blank indentation is removed for a collapsed plain textarea cursor', () => {
-  const h = setup({ monaco: false }); h.paste('text');
-  assert.equal(h.target.value, 'textold'); assert.equal(h.target.selectionStart, 4);
+test('blank indentation joins the native textarea paste range without a direct value write', () => {
+  const h = setup({ monaco: false }); const e = h.paste('text');
+  assert.equal(h.target.value, '    old'); assert.equal(h.target.selectionStart, 0);
+  assert.equal(h.target.selectionEnd, 4); assert.equal(e.prevented, false);
+  assert.equal(h.calls.commands, 0);
 });
 test('readonly and disabled textareas stay unchanged', () => {
   for (const options of [{ readonly: true }, { disabled: true }]) {
@@ -320,4 +330,57 @@ test('Monaco exception checks the original model after a callback replaces the e
   const e = h.paste('old');
   assert.equal(e.prevented, true); assert.equal(e.stopped, true);
   assert.equal(h.model.version, 2); assert.equal(h.calls.edits.length, 1);
+});
+
+test('React class and hook refs discover Monaco without window.monaco', () => {
+  for (const kind of ['class', 'hook']) {
+    const h = setup({ beforeInstall: win => { delete win.monaco; } });
+    h.root.__reactFiber$test = kind === 'class'
+      ? { stateNode: { editor: h.editor } }
+      : { memoizedState: { memoizedState: { current: h.editor }, next: null } };
+    assert.equal(h.paste('React').prevented, true);
+    assert.equal(h.model.value, 'Reactold');
+    assert.equal(h.calls.edits.length, 1);
+  }
+});
+
+test('React discovery never invokes app getters or chooses another editor root', () => {
+  const h = setup({ beforeInstall: win => { delete win.monaco; } });
+  let getterCalls = 0;
+  const holder = {};
+  Object.defineProperty(holder, 'editor', { enumerable: true, get() { getterCalls++; return h.editor; } });
+  h.root.__reactFiber$test = { stateNode: holder };
+  const e = h.paste('wrong');
+  assert.equal(getterCalls, 0); assert.equal(e.prevented, false);
+  assert.equal(h.model.value, '    old');
+  holder.otherEditor = { ...h.editor, getDomNode: () => ({ classList: h.root.classList }) };
+  assert.equal(h.paste('wrong').prevented, false);
+  assert.equal(h.calls.edits.length, 0);
+});
+
+test('empty native clipboard data cannot paste asynchronously after focus moves', async () => {
+  const h = setup({ monaco: false }); const e = h.paste('');
+  const other = {}; h.target.ownerDocument.activeElement = other;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.reads, 0); assert.equal(h.calls.commands, 0);
+  assert.equal(h.target.value, '    old');
+  assert.equal(h.target.ownerDocument.activeElement, other);
+  assert.equal(e.prevented, false);
+});
+
+test('keyboard shortcut handlers run at window capture before document blockers', () => {
+  const h = setup();
+  assert.ok(h.calls.registrations.some(({ type, options }) => type === 'keydown' && options === true));
+});
+
+test('Monaco copy and cut use model selection without deleting its indentation', () => {
+  const h = setup({ selected: true });
+  for (const type of ['copy', 'cut']) {
+    let copied, prevented = false;
+    h.handlers[type]({ target: h.target, clipboardData: { setData: (_type, text) => { copied = text; } },
+      preventDefault() { prevented = true; }, stopImmediatePropagation() {} });
+    assert.equal(copied, 'old'); assert.equal(prevented, true);
+    assert.equal(h.model.value, type === 'copy' ? '    old' : '    ');
+  }
+  assert.equal(h.calls.edits.length, 1);
 });
