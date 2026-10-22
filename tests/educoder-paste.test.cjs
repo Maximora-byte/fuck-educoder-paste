@@ -384,3 +384,37 @@ test('Monaco copy and cut use model selection without deleting its indentation',
   }
   assert.equal(h.calls.edits.length, 1);
 });
+
+function adapterFixture(kind, { widget = false, selected = false } = {}) {
+  const h = setup({ selected });
+  h.root.classList.contains = name => name === kind;
+  let start = 4, end = selected ? 7 : 4, writes = 0;
+  const input = { contains: el => !widget && el === h.target };
+  const write = text => { writes++; h.model.value = h.model.value.slice(0, start) + text + h.model.value.slice(end); };
+  h.root.CodeMirror = { getInputField: () => input, getOption: () => false, operation: fn => fn(),
+    listSelections: () => [{ anchor: { line: 0, ch: start }, head: { line: 0, ch: end } }],
+    getLine: () => h.model.value, setSelection: (a, b) => { start = a.ch; end = b.ch; },
+    replaceSelections: texts => write(texts[0]) };
+  h.root.env = { editor: { textInput: { getElement: () => input }, getReadOnly: () => false, insert: write } };
+  h.root.querySelector = () => ({ contains: input.contains, cmView: { view: {
+    state: { readOnly: false, replaceSelection: text => ({ text }) }, dispatch: change => write(change.text)
+  } } });
+  return { ...h, writes: () => writes };
+}
+
+for (const kind of ['CodeMirror', 'ace_editor', 'cm-editor']) {
+  test(`${kind} widget input preserves native paste without a model write`, () => {
+    const h = adapterFixture(kind, { widget: true }); const e = h.paste('search');
+    assert.equal(h.writes(), 0); assert.equal(h.model.value, '    old');
+    assert.equal(e.prevented, false); assert.equal(e.stopped, false);
+  });
+  test(`${kind} actual input still uses its editor API`, () => {
+    const h = adapterFixture(kind); const e = h.paste('new');
+    assert.equal(h.writes(), 1); assert.equal(e.prevented, true);
+  });
+}
+
+test('Educoder CodeMirror selected text preserves its unselected whitespace prefix', () => {
+  const h = adapterFixture('CodeMirror', { selected: true }); h.paste('NEW');
+  assert.equal(h.model.value, '    NEW'); assert.equal(h.writes(), 1);
+});

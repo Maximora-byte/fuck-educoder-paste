@@ -334,17 +334,21 @@
       const root = editorRoot(el);
       if (!root) return { type: "native", el };
       if (root.classList.contains("CodeMirror") && root.CodeMirror) {
-        return { type: "codemirror", el, editor: root.CodeMirror };
+        const input = root.CodeMirror.getInputField?.();
+        if (input === el || input?.contains?.(el)) {
+          return { type: "codemirror", el, editor: root.CodeMirror };
+        }
       }
       if (root.classList.contains("ace_editor")) {
         const editor = root.env?.editor;
-        if (editor) return { type: "ace", el, editor };
+        const input = editor?.textInput?.getElement?.();
+        if (editor && (input === el || input?.contains?.(el))) return { type: "ace", el, editor };
       }
       if (root.classList.contains("cm-editor")) {
         // CodeMirror 6 publishes its view on the content view's DOM node.
         const content = root.querySelector(".cm-content");
         const view = content?.cmView?.view || root.cmView?.view;
-        if (view?.dispatch && view?.state?.replaceSelection) {
+        if (view?.dispatch && view?.state?.replaceSelection && (content === el || content?.contains?.(el))) {
           return { type: "codemirror6", el, editor: view };
         }
       }
@@ -458,7 +462,8 @@
           const ranges = editor.listSelections();
           // Expanding multiple ranges can merge cursors or create overlapping
           // edits. Preserve their original boundaries, including for cuts.
-          if (cleanIndent && ranges.length === 1) {
+          if (cleanIndent && ranges.length === 1 &&
+              ranges[0].anchor.line === ranges[0].head.line && ranges[0].anchor.ch === ranges[0].head.ch) {
             const { anchor: a, head: h } = ranges[0];
             const start = a.line < h.line || (a.line === h.line && a.ch <= h.ch) ? a : h;
             const end = start === a ? h : a;

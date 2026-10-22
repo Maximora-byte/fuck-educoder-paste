@@ -56,7 +56,7 @@ node --check fuck-educoder-paste.user.js
 node --test tests/*.test.cjs
 ```
 
-- 当前 126 个隔离回归测试通过。学习通既有回归测试全部保留；头歌测试更新为原生 textarea 范围处理，并增加 React 实例发现、应用 getter 防护、无延迟粘贴、快捷键阶段及复制/剪切测试。
+- 当前 133 个隔离回归测试通过。学习通既有回归测试全部保留；头歌测试覆盖原生 textarea 范围、React 实例发现、应用 getter 防护、无延迟粘贴、快捷键阶段、复制/剪切、编辑器搜索框隔离及选区前缩进保护。
 - Monaco 缺少必要 API 或写入前抛错时保留原生事件；写入后抛错时通过原模型版本/内容变化避免重复粘贴，同文本替换使用版本变化判断。异常时仍尝试关闭撤销边界。
 - 测试提取实际源码函数，使用编辑器 API / DOM 模拟。包括只读、验证器取消、同文本替换、异常后重复粘贴、错误实例/宿主、动态挂载、旧焦点/选区及异步光标变化。
 - 可选 `node tests/browser-smoke.cjs` 使用预装 Playwright 和 Chromium（可用 `CHROMIUM_PATH` 指定路径）。所有页面请求本地填充或阻断；不访问课程站点，UEditor / CodeMirror 仍是 API 模拟。无需为基础测试安装它们。
